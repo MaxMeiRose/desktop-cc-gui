@@ -1330,6 +1330,8 @@ export const zh = {
     clean: "无变更",
     generateCommitMessage: "AI 生成提交信息",
     generatingCommitMessage: "正在生成…",
+    generateCommitMessageHint: "使用 {{engine}} 的渠道（{{host}}）生成；仓库 diff 会发送到该渠道",
+    generateCommitMessageNoChannel: "使用当前引擎 {{engine}} 的渠道生成；该引擎尚未配置可用渠道",
     uncommittedChanges: "个未提交变更",
     newFile: "新文件",
     viewAsTree: "切换为树状视图",

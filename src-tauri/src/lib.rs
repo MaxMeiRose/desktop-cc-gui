@@ -560,6 +560,7 @@ pub fn run() {
             git::git_commit,
             git::git_discover_repositories,
             commit_message::git_generate_commit_message,
+            commit_message::git_commit_message_channel,
             git::git_push,
             git::git_pull,
             git::git_branches,

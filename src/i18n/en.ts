@@ -1390,6 +1390,8 @@ export const en: Messages = {
     clean: "No changes",
     generateCommitMessage: "Generate message with AI",
     generatingCommitMessage: "Generating…",
+    generateCommitMessageHint: "Generate via the {{engine}} channel ({{host}}); the repo diff is sent to that channel",
+    generateCommitMessageNoChannel: "Generate via the current engine {{engine}}'s channel; no usable channel is configured for it yet",
     uncommittedChanges: "uncommitted changes",
     newFile: "New",
     viewAsTree: "View as tree",

@@ -542,6 +542,7 @@ function RepoChangesPanel({
             workspacePath={gitWorkspacePath}
             stagedCount={status?.staged.length ?? 0}
             selectedCount={selectedFiles.size}
+            selectedFiles={selectedFiles}
             onCommitSelected={handleCommitSelected}
             busy={pending.commit === true}
             commitMsg={commitMsg}
@@ -601,6 +602,7 @@ function RepoChangesPanel({
           workspacePath={gitWorkspacePath}
           stagedCount={status?.staged.length ?? 0}
           selectedCount={selectedFiles.size}
+          selectedFiles={selectedFiles}
           onCommitSelected={handleCommitSelected}
           busy={pending.commit === true}
           commitMsg={commitMsg}

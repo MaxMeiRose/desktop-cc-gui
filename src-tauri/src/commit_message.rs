@@ -5,11 +5,16 @@
 //! The prompt only ever carries repository state (status codes + diff text),
 //! never credentials: the api key rides a request header, and every error
 //! path below reports status/parse failures without echoing it.
+//!
+//! Channel → HTTP is defined exactly once, in `memory::review`
+//! (`resolve_wire` / `call_channel`): Claude alias mapping, credential
+//! priority, the `wire_api = "responses"` branch, and the dual Anthropic
+//! auth headers all live there, so this module cannot drift from what the
+//! chat path does.
 
 use crate::config;
+use crate::memory::review::{call_channel, resolve_wire, Wire};
 use crate::provider_files::channel_field;
-use serde_json::{json, Value};
-use std::time::Duration;
 
 /// Patch text budget. The diff is only a hint for the model — the message
 /// must stay cheap to produce, and a huge patch would both blow the context
@@ -21,102 +26,85 @@ const DIFF_TRUNCATION_NOTE: &str = "… diff truncated …";
 const MAX_MESSAGE_CHARS: usize = 500;
 
 /// A channel resolved to everything one chat call needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedChannel {
     pub engine: String,
-    pub base_url: String,
-    pub api_key: String,
-    pub model: Option<String>,
+    pub wire: Wire,
 }
 
 /// HTTP credentials come from a configured channel; the official CLI config
 /// has none, so generation only works once the user configures a channel.
 pub(crate) const NO_CHANNEL_ERROR: &str =
-    "未找到可用渠道：请在设置 → 渠道管理中为某个引擎配置渠道（baseUrl + apiKey）";
-
-/// Which wire shape an engine speaks. Claude relays answer Anthropic
-/// Messages; everything else is OpenAI-compatible, so one branch covers the
-/// remaining engines instead of a per-engine match that would rot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ApiShape {
-    Anthropic,
-    OpenAi,
-}
-
-pub(crate) fn api_shape(engine: &str) -> ApiShape {
-    if engine == "claude" {
-        ApiShape::Anthropic
-    } else {
-        ApiShape::OpenAi
-    }
-}
+    "未找到可用渠道：请在设置 → 渠道管理中为某个引擎配置渠道（baseUrl + apiKey + model）";
 
 /// The first channel whose config yields both an endpoint and a credential,
 /// scanning `config::ENGINES` in order so repeated calls agree. `engine`
 /// restricts the scan to one engine; unknown ids fail loudly instead of
-/// silently rerouting the request to another engine's channel.
+/// silently rerouting the request to another engine's channel, and an
+/// explicit engine with no usable channel reports *why* instead of falling
+/// through to a third party the user is not using.
 pub(crate) fn first_usable_channel(engine_filter: Option<&str>) -> Result<ResolvedChannel, String> {
+    let explicit = engine_filter.is_some();
     let candidates: Vec<&str> = match engine_filter {
         Some(engine) if config::ENGINES.contains(&engine) => vec![engine],
         Some(engine) => return Err(format!("未知的引擎：{engine}")),
         None => config::ENGINES.iter().copied().collect(),
     };
+    let mut first_failure: Option<String> = None;
     for engine in candidates {
         // A disabled engine, or a section that cannot be read, is a normal
         // state of *some* engine - not a reason to fail the whole scan. Skip
         // it and keep looking, so a user who disabled one engine still gets a
-        // message from another.
-        let Ok(Some(provider)) = config::resolve_provider(engine, None) else {
-            continue;
+        // message from another. An explicit request fails loudly instead.
+        let provider = match config::resolve_provider(engine, None) {
+            Ok(Some(provider)) => provider,
+            Ok(None) if explicit => {
+                // Official configs resolve to `None`: no HTTP credential.
+                return Err(format!(
+                    "引擎 {engine} 未配置渠道：请在设置 → 渠道管理中为它配置渠道（baseUrl + apiKey + model）"
+                ));
+            }
+            Ok(None) => continue,
+            Err(error) if explicit => return Err(format!("引擎 {engine} 不可用：{error}")),
+            Err(_) => continue,
         };
-        // Official configs resolve to `None`: no HTTP credential to borrow.
-        let (Some(base_url), Some(api_key)) = (
-            channel_field(engine, &provider, "baseUrl"),
-            channel_field(engine, &provider, "apiKey"),
-        ) else {
-            continue;
-        };
-        return Ok(ResolvedChannel {
-            engine: engine.to_string(),
-            base_url,
-            api_key,
-            model: channel_field(engine, &provider, "model"),
-        });
+        // No live session backs this call, so the channel's own configured
+        // model takes the session-model slot: for Claude that also routes
+        // opus/sonnet-style UI aliases through resolve_claude_channel_model
+        // (relays reject the bare alias as an unknown model).
+        let configured_model = channel_field(engine, &provider, "model");
+        match resolve_wire(engine, &provider, configured_model.as_deref()) {
+            Ok(wire) => {
+                return Ok(ResolvedChannel {
+                    engine: engine.to_string(),
+                    wire,
+                })
+            }
+            Err(reason) if explicit => {
+                return Err(format!("引擎 {engine} 的渠道不可用：{reason}"))
+            }
+            Err(reason) => {
+                first_failure.get_or_insert_with(|| format!("{engine}: {reason}"));
+            }
+        }
     }
-    Err(NO_CHANNEL_ERROR.to_string())
-}
-
-/// Join a channel's base URL with an endpoint path, tolerating a base that
-/// already carries the API version (`…/v1`): appending blindly yields the
-/// `/v1/v1/messages` no relay serves.
-pub(crate) fn join_endpoint(base_url: &str, suffix: &str) -> String {
-    let base = base_url.trim().trim_end_matches('/');
-    if !suffix.is_empty() && base.ends_with(suffix) {
-        return base.to_string();
-    }
-    if base.ends_with("/v1") && suffix.starts_with("/v1/") {
-        return format!("{}{}", &base[..base.len() - 3], suffix);
-    }
-    format!("{base}{suffix}")
-}
-
-/// The endpoint one chat request goes to, with the same `/v1` normalization.
-pub(crate) fn chat_endpoint(channel: &ResolvedChannel) -> String {
-    match api_shape(&channel.engine) {
-        ApiShape::Anthropic => join_endpoint(&channel.base_url, "/v1/messages"),
-        ApiShape::OpenAi => join_endpoint(&channel.base_url, "/v1/chat/completions"),
-    }
+    Err(match first_failure {
+        Some(reason) => format!("{NO_CHANNEL_ERROR}（{reason}）"),
+        None => NO_CHANNEL_ERROR.to_string(),
+    })
 }
 
 // ==================== Repository context ====================
 
 /// Which changes the message describes. Staged wins because `git_commit`
 /// commits the index — describing the worktree instead would produce a
-/// message about changes the commit does not contain.
+/// message about changes the commit does not contain. `Selected` is the
+/// commit button's actual plan: exactly the checked paths, staged or not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiffScope {
     Staged,
     Worktree,
+    Selected,
 }
 
 fn staged_bucket(status: git2::Status) -> bool {
@@ -316,6 +304,9 @@ fn render_diff(repo: &git2::Repository, scope: DiffScope) -> Result<String, Stri
                 }
             }
         }
+        // build_context routes Selected to selected_context, which renders
+        // via render_selected_diff against the exact commit content.
+        DiffScope::Selected => unreachable!("selected scope renders via render_selected_diff"),
     }
     Ok(text)
 }
@@ -342,7 +333,94 @@ pub(crate) struct CommitContext {
     pub diff: String,
 }
 
-pub(crate) fn build_context(repo: &git2::Repository) -> Result<CommitContext, String> {
+/// Context for an explicit selection — exactly the paths the commit button
+/// stages and commits, so the generated message never describes files the
+/// commit leaves out (or misses files it picks up). The commit stages every
+/// selected path first, so the content to describe is HEAD vs the worktree
+/// (staged edits included), restricted to the selection.
+fn selected_context(repo: &git2::Repository, paths: &[String]) -> Result<CommitContext, String> {
+    let wanted: std::collections::HashSet<&str> =
+        paths.iter().map(String::as_str).collect();
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    let statuses = repo.statuses(Some(&mut opts)).map_err(|e| e.to_string())?;
+    let mut lines: Vec<String> = Vec::new();
+    let mut tracked: Vec<String> = Vec::new();
+    let mut untracked: Vec<String> = Vec::new();
+    for entry in statuses.iter() {
+        let Some(path) = entry.path().filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        if !wanted.contains(path) {
+            continue;
+        }
+        if untracked_only(entry.status()) {
+            untracked.push(path.to_string());
+            lines.push(format!("?? {path}"));
+        } else {
+            tracked.push(path.to_string());
+            lines.push(format!("{} {}", code_for(entry.status()), path));
+        }
+    }
+    if lines.is_empty() {
+        return Err("没有可提交的变更".to_string());
+    }
+    lines.sort();
+    let diff = cap_diff_text(&render_selected_diff(repo, &tracked, &untracked)?);
+    Ok(CommitContext {
+        scope: DiffScope::Selected,
+        files: lines.join("\n"),
+        diff,
+    })
+}
+
+/// Patch for the selected tracked paths: HEAD tree → workdir-with-index is
+/// the exact content the commit will carry once the selected paths are
+/// staged. Untracked selections are listed by name only — same budget
+/// rationale as the worktree scope.
+fn render_selected_diff(
+    repo: &git2::Repository,
+    tracked: &[String],
+    untracked: &[String],
+) -> Result<String, String> {
+    let mut text = String::new();
+    if !tracked.is_empty() {
+        let mut opts = git2::DiffOptions::new();
+        // Same three context lines as `git diff`, same rationale as
+        // render_diff: without them the +/- markers vanish.
+        opts.context_lines(3);
+        for path in tracked {
+            opts.pathspec(path);
+        }
+        // An unborn HEAD has no tree; diffing against None compares against
+        // the empty tree, i.e. exactly the initial commit.
+        let head_tree = repo.head().and_then(|head| head.peel_to_tree()).ok();
+        let diff = repo
+            .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))
+            .map_err(|e| e.to_string())?;
+        append_patch(&diff, &mut text)?;
+    }
+    if !untracked.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            push_capped(&mut text, "\n");
+        }
+        push_capped(&mut text, "Untracked files (path only):\n");
+        for path in untracked {
+            if !push_capped(&mut text, &format!("  ?? {path}\n")) {
+                break;
+            }
+        }
+    }
+    Ok(text)
+}
+
+pub(crate) fn build_context(
+    repo: &git2::Repository,
+    selection: Option<&[String]>,
+) -> Result<CommitContext, String> {
+    if let Some(paths) = selection {
+        return selected_context(repo, paths);
+    }
     let scope = choose_scope(repo)?;
     let files = status_short_lines(repo, scope)?;
     if files.trim().is_empty() {
@@ -368,6 +446,7 @@ fn scope_heading(scope: DiffScope) -> &'static str {
     match scope {
         DiffScope::Staged => "staged changes",
         DiffScope::Worktree => "unstaged and untracked changes",
+        DiffScope::Selected => "selected changes",
     }
 }
 
@@ -396,32 +475,6 @@ pub(crate) fn build_prompt(context: &CommitContext, locale: &str) -> String {
 }
 
 // ==================== Response handling ====================
-
-/// Text out of an Anthropic Messages reply: `content` blocks of type text.
-/// Non-text blocks (thinking, tool use) are skipped rather than stringified.
-pub(crate) fn extract_anthropic_text(body: &Value) -> Option<String> {
-    let blocks = body.get("content")?.as_array()?;
-    let mut out = String::new();
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(text) = block.get("text").and_then(Value::as_str) {
-                out.push_str(text);
-            }
-        }
-    }
-    (!out.trim().is_empty()).then_some(out)
-}
-
-/// Text out of an OpenAI chat completion reply.
-pub(crate) fn extract_openai_text(body: &Value) -> Option<String> {
-    let text = body
-        .get("choices")?
-        .get(0)?
-        .get("message")?
-        .get("content")?
-        .as_str()?;
-    (!text.trim().is_empty()).then(|| text.to_string())
-}
 
 /// Strip a markdown fence the model wrapped its answer in, including the
 /// optional info string (```` ```text ````) that would otherwise be mistaken
@@ -505,165 +558,88 @@ pub(crate) fn clean_message(raw: &str) -> String {
     format!("{}…", capped.trim_end())
 }
 
-/// First model id out of the shapes a relay's model list answers (`data[].id`,
-/// a bare array, `models[].id`) — the same shapes `provider_models` parses
-/// for the provider dialog, kept local so this module needs no new surface
-/// there.
-pub(crate) fn first_model_id(value: &Value) -> Option<String> {
-    let items = value
-        .get("data")
-        .and_then(Value::as_array)
-        .or_else(|| value.as_array())
-        .or_else(|| value.get("models").and_then(Value::as_array))?;
-    items.iter().find_map(|item| {
-        let candidate = match item {
-            Value::String(id) => Some(id.as_str()),
-            Value::Object(map) => map.get("id").and_then(Value::as_str),
-            _ => None,
-        };
-        candidate
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-    })
-}
-
-/// Model id to call with. Codex channels routinely carry no `model` field, so
-/// fall back to the channel's model list — the only other place an id exists.
-async fn resolve_model(
-    client: &reqwest::Client,
-    channel: &ResolvedChannel,
-) -> Result<String, String> {
-    if let Some(model) = channel.model.clone() {
-        return Ok(model);
-    }
-    let endpoint = join_endpoint(&channel.base_url, "/v1/models");
-    let response = client
-        .get(&endpoint)
-        .header("Authorization", format!("Bearer {}", channel.api_key))
-        .header("x-api-key", channel.api_key.as_str())
-        .send()
-        .await
-        .map_err(|e| format!("渠道未配置 model，且获取模型列表失败：{e}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("渠道未配置 model，且获取模型列表失败：HTTP {status}"));
-    }
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("渠道未配置 model，且获取模型列表失败：{e}"))?;
-    let value: Value =
-        serde_json::from_str(&body).map_err(|e| format!("获取模型列表失败：{e}"))?;
-    first_model_id(&value).ok_or_else(|| {
-        "渠道未配置 model，且模型列表为空：请在渠道设置中填写 model".to_string()
-    })
-}
-
-/// Full reply handling for one API shape.
-pub(crate) fn message_from_reply(shape: ApiShape, body: &Value) -> Result<String, String> {
-    let raw = match shape {
-        ApiShape::Anthropic => extract_anthropic_text(body),
-        ApiShape::OpenAi => extract_openai_text(body),
-    }
-    .ok_or_else(|| "模型未返回提交信息".to_string())?;
-    let cleaned = clean_message(&raw);
-    if cleaned.is_empty() {
-        return Err("模型未返回提交信息".to_string());
-    }
-    Ok(cleaned)
-}
-
 // ==================== Commands ====================
 
-fn request_body(shape: ApiShape, model: &str, prompt: &str) -> Value {
-    match shape {
-        ApiShape::Anthropic => json!({
-            "model": model,
-            "max_tokens": 512,
-            "messages": [{"role": "user", "content": prompt}],
-        }),
-        ApiShape::OpenAi => json!({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-        }),
-    }
+/// What the generate button produced, plus the channel it went through — the
+/// UI shows the engine/host so a repo diff never leaves for a third party
+/// the user did not see named.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedCommitMessage {
+    pub message: String,
+    pub engine: String,
+    pub base_url: String,
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))
+/// Channel the generate button would use for one engine; feeds its tooltip.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitMessageChannel {
+    pub engine: String,
+    pub base_url: String,
 }
 
 async fn generate_commit_message_impl(
     engine: Option<String>,
     path: String,
     locale: String,
-) -> Result<String, String> {
+    files: Option<Vec<String>>,
+) -> Result<GeneratedCommitMessage, String> {
     // Status + diff walks belong off the async runtime, same rationale as
     // `git_status_blocking`.
     let context = tauri::async_runtime::spawn_blocking(move || {
         let repo = crate::git::open_repo(&path)?;
-        build_context(&repo)
+        build_context(&repo, files.as_deref())
     })
     .await
     .map_err(|e| e.to_string())??;
 
     let channel = first_usable_channel(engine.as_deref())?;
     let prompt = build_prompt(&context, &locale);
-    let shape = api_shape(&channel.engine);
-
-    let client = http_client()?;
-    let model = resolve_model(&client, &channel).await?;
-    let endpoint = chat_endpoint(&channel);
-    let mut request = client
-        .post(&endpoint)
-        .json(&request_body(shape, &model, &prompt));
-    request = match shape {
-        ApiShape::Anthropic => request
-            .header("x-api-key", channel.api_key.as_str())
-            .header("anthropic-version", "2023-06-01"),
-        ApiShape::OpenAi => request.header("Authorization", format!("Bearer {}", channel.api_key)),
-    };
-    let response = request
-        .send()
+    let raw = call_channel(&channel.wire, &prompt)
         .await
-        // A transport error never carries the request headers, so `e` is safe
-        // to surface verbatim.
         .map_err(|e| format!("请求渠道失败：{e}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("读取渠道响应失败：{e}"))?;
-    if !status.is_success() {
-        // Relays sometimes echo the request (headers included) in the error
-        // body: report the status alone so no credential reaches the UI.
-        return Err(format!("渠道返回 HTTP {status}"));
+    let message = clean_message(&raw);
+    if message.is_empty() {
+        return Err("模型未返回提交信息".to_string());
     }
-    let value: Value =
-        serde_json::from_str(&body).map_err(|_| "渠道响应不是合法 JSON".to_string())?;
-    message_from_reply(shape, &value)
+    Ok(GeneratedCommitMessage {
+        message,
+        engine: channel.engine,
+        base_url: channel.wire.base_url,
+    })
 }
 
 /// Ask the configured channel for a commit message describing `path`'s pending
-/// changes. Errors are short, actionable Chinese text; credentials never
-/// appear in them.
+/// changes. `files` restricts the described set to the paths the commit
+/// button would actually commit; `None` describes the index (or the worktree
+/// when nothing is staged). Errors are short, actionable Chinese text;
+/// credentials never appear in them.
 #[tauri::command]
 pub async fn git_generate_commit_message(
     engine: Option<String>,
     path: String,
     locale: String,
-) -> Result<String, String> {
-    generate_commit_message_impl(engine, path, locale).await
+    files: Option<Vec<String>>,
+) -> Result<GeneratedCommitMessage, String> {
+    generate_commit_message_impl(engine, path, locale, files).await
+}
+
+/// Resolve the channel the generate button will use for `engine`, so its
+/// tooltip can name the engine and host the repo diff would be sent to.
+#[tauri::command]
+pub fn git_commit_message_channel(engine: String) -> Result<CommitMessageChannel, String> {
+    let channel = first_usable_channel(Some(&engine))?;
+    Ok(CommitMessageChannel {
+        engine: channel.engine,
+        base_url: channel.wire.base_url,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
     use std::path::PathBuf;
 
     struct Scratch(PathBuf);
@@ -715,54 +691,6 @@ mod tests {
     }
 
     #[test]
-    fn shape_follows_the_engine() {
-        assert_eq!(api_shape("claude"), ApiShape::Anthropic);
-        assert_eq!(api_shape("codex"), ApiShape::OpenAi);
-        assert_eq!(api_shape("kimi"), ApiShape::OpenAi);
-        assert_eq!(api_shape("grok"), ApiShape::OpenAi);
-    }
-
-    #[test]
-    fn endpoint_join_avoids_doubling_the_api_version() {
-        assert_eq!(
-            join_endpoint("https://a.example/v1", "/v1/messages"),
-            "https://a.example/v1/messages"
-        );
-        assert_eq!(
-            join_endpoint("https://a.example/", "/v1/messages"),
-            "https://a.example/v1/messages"
-        );
-        assert_eq!(
-            join_endpoint("https://a.example/anthropic", "/v1/messages"),
-            "https://a.example/anthropic/v1/messages"
-        );
-        // Already the full endpoint: nothing appended.
-        assert_eq!(
-            join_endpoint("https://a.example/v1/messages", "/v1/messages"),
-            "https://a.example/v1/messages"
-        );
-    }
-
-    #[test]
-    fn chat_endpoint_follows_the_api_shape() {
-        let claude = ResolvedChannel {
-            engine: "claude".to_string(),
-            base_url: "https://a.example/v1".to_string(),
-            api_key: "sk-a".to_string(),
-            model: Some("m".to_string()),
-        };
-        assert_eq!(chat_endpoint(&claude), "https://a.example/v1/messages");
-        let codex = ResolvedChannel {
-            engine: "codex".to_string(),
-            ..claude
-        };
-        assert_eq!(
-            chat_endpoint(&codex),
-            "https://a.example/v1/chat/completions"
-        );
-    }
-
-    #[test]
     fn scope_prefers_staged_and_falls_back_to_the_worktree() {
         let scratch = Scratch::new();
         let repo = git2::Repository::init(&scratch.0).unwrap();
@@ -775,7 +703,7 @@ mod tests {
         stage(&repo, "tracked.txt");
         assert_eq!(choose_scope(&repo).unwrap(), DiffScope::Staged);
 
-        let context = build_context(&repo).unwrap();
+        let context = build_context(&repo, None).unwrap();
         assert_eq!(context.scope, DiffScope::Staged);
         assert!(context.files.contains("tracked.txt"));
         assert!(context.diff.contains("+two"));
@@ -793,7 +721,7 @@ mod tests {
         stage(&repo, "a.txt");
         std::fs::write(scratch.0.join("b.txt"), "changed\n").unwrap();
 
-        let context = build_context(&repo).unwrap();
+        let context = build_context(&repo, None).unwrap();
         assert_eq!(context.scope, DiffScope::Staged);
         assert!(context.files.contains("a.txt"));
         assert!(!context.files.contains("b.txt"));
@@ -846,7 +774,7 @@ mod tests {
         std::fs::write(scratch.0.join("fresh.txt"), "brand new content\n").unwrap();
         std::fs::write(scratch.0.join("a.txt"), "a changed\n").unwrap();
 
-        let context = build_context(&repo).unwrap();
+        let context = build_context(&repo, None).unwrap();
         assert_eq!(context.scope, DiffScope::Worktree);
         assert!(context.files.contains("?? fresh.txt"));
         assert!(context.diff.contains("+a changed"), "diff was {:?}", context.diff);
@@ -861,7 +789,7 @@ mod tests {
         let repo = git2::Repository::init(&scratch.0).unwrap();
         commit_file(&repo, "a.txt", "a\n");
         assert_eq!(
-            build_context(&repo).unwrap_err(),
+            build_context(&repo, None).unwrap_err(),
             "没有可提交的变更"
         );
     }
@@ -873,7 +801,7 @@ mod tests {
         std::fs::write(scratch.0.join("first.txt"), "hello\n").unwrap();
         stage(&repo, "first.txt");
 
-        let context = build_context(&repo).unwrap();
+        let context = build_context(&repo, None).unwrap();
         assert_eq!(context.scope, DiffScope::Staged);
         assert!(context.diff.contains("+hello"));
     }
@@ -937,35 +865,6 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_reply_joins_text_blocks() {
-        let body = json!({
-            "content": [
-                {"type": "thinking", "text": "ignored"},
-                {"type": "text", "text": "feat: add panel"},
-            ]
-        });
-        assert_eq!(
-            extract_anthropic_text(&body).as_deref(),
-            Some("feat: add panel")
-        );
-        assert_eq!(extract_anthropic_text(&json!({"content": []})), None);
-        assert_eq!(extract_anthropic_text(&json!({})), None);
-    }
-
-    #[test]
-    fn openai_reply_reads_the_first_choice() {
-        let body = json!({
-            "choices": [{"message": {"role": "assistant", "content": "fix: guard"}}]
-        });
-        assert_eq!(extract_openai_text(&body).as_deref(), Some("fix: guard"));
-        assert_eq!(extract_openai_text(&json!({"choices": []})), None);
-        assert_eq!(
-            extract_openai_text(&json!({"choices": [{"message": {"content": "  "}}]})),
-            None
-        );
-    }
-
-    #[test]
     fn cleaning_strips_fences_quotes_and_padding() {
         assert_eq!(
             clean_message("```\nfeat: add panel\n```"),
@@ -990,73 +889,6 @@ mod tests {
         // Multi-byte input must not panic and stays within the char budget.
         let cjk = "提".repeat(MAX_MESSAGE_CHARS + 10);
         assert!(clean_message(&cjk).chars().count() <= MAX_MESSAGE_CHARS);
-    }
-
-    #[test]
-    fn reply_handling_reports_an_empty_model_answer() {
-        let anthropic = json!({"content": [{"type": "text", "text": "   "}]});
-        assert_eq!(
-            message_from_reply(ApiShape::Anthropic, &anthropic).unwrap_err(),
-            "模型未返回提交信息"
-        );
-        let openai = json!({"choices": []});
-        assert_eq!(
-            message_from_reply(ApiShape::OpenAi, &openai).unwrap_err(),
-            "模型未返回提交信息"
-        );
-        let good = json!({"content": [{"type": "text", "text": "```chore: init```"}]});
-        assert_eq!(
-            message_from_reply(ApiShape::Anthropic, &good).unwrap(),
-            "chore: init"
-        );
-    }
-
-    #[test]
-    fn request_bodies_match_their_api_shape() {
-        let channel = ResolvedChannel {
-            engine: "claude".to_string(),
-            base_url: "https://a.example".to_string(),
-            api_key: "sk-secret".to_string(),
-            model: Some("m".to_string()),
-        };
-        let model = channel.model.as_deref().unwrap();
-
-        let anthropic = request_body(ApiShape::Anthropic, model, "p");
-        assert_eq!(anthropic["model"], json!("m"));
-        assert_eq!(anthropic["messages"][0]["content"], json!("p"));
-        assert!(anthropic.get("max_tokens").is_some());
-
-        let openai = request_body(ApiShape::OpenAi, model, "p");
-        assert_eq!(openai["messages"][0]["role"], json!("user"));
-        assert!(openai.get("max_tokens").is_none());
-
-        // The credential lives in a header, never in the body.
-        assert!(!openai.to_string().contains("sk-secret"));
-        assert!(!anthropic.to_string().contains("sk-secret"));
-    }
-
-    #[test]
-    fn model_fallback_takes_the_first_id_of_every_list_shape() {
-        // OpenAI relay shape.
-        assert_eq!(
-            first_model_id(&json!({"data": [{"id": "gpt-5"}, {"id": "o3"}]})),
-            Some("gpt-5".to_string())
-        );
-        // Bare array (some relays).
-        assert_eq!(
-            first_model_id(&json!(["kimi-k2", "other"])),
-            Some("kimi-k2".to_string())
-        );
-        // Anthropic `models` shape.
-        assert_eq!(
-            first_model_id(&json!({"models": [{"id": "claude-x"}]})),
-            Some("claude-x".to_string())
-        );
-        // Blank / unusable / empty lists fall through to the error path.
-        assert_eq!(first_model_id(&json!({"data": [{"id": "  "}]})), None);
-        assert_eq!(first_model_id(&json!({"data": [{"nope": 1}]})), None);
-        assert_eq!(first_model_id(&json!({"data": []})), None);
-        assert_eq!(first_model_id(&json!({})), None);
     }
 
     #[test]
@@ -1093,17 +925,15 @@ mod tests {
             }
         }
 
-        fn seed(&self, current: Option<&str>, provider: Value) {
+        fn seed(&self, engine: &str, current: Option<&str>, provider: Value) {
             let config_path = crate::paths::config_path();
             std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-            let document = if let Some(current) = current {
-                json!({
-                    "claude": {"providers": {"chan-a": provider}, "current": current}
-                })
+            let section = if let Some(current) = current {
+                json!({"providers": {"chan-a": provider}, "current": current})
             } else {
-                json!({"claude": {"providers": {"chan-a": provider}}})
+                json!({"providers": {"chan-a": provider}})
             };
-            std::fs::write(config_path, document.to_string()).unwrap();
+            std::fs::write(config_path, json!({engine: section}).to_string()).unwrap();
         }
     }
 
@@ -1124,7 +954,11 @@ mod tests {
     #[test]
     fn channel_lookup_without_any_channel_is_actionable() {
         let scratch = HomeScratch::new();
-        scratch.seed(None, json!({"baseUrl": "https://a.example", "apiKey": "sk-a"}));
+        scratch.seed(
+            "claude",
+            None,
+            json!({"baseUrl": "https://a.example", "apiKey": "sk-a"}),
+        );
         // No `current`: the section's official config applies, which has no
         // HTTP credential — the user must configure a channel.
         let error = first_usable_channel(None).unwrap_err();
@@ -1136,23 +970,130 @@ mod tests {
     fn channel_lookup_reads_base_url_key_and_model() {
         let scratch = HomeScratch::new();
         scratch.seed(
+            "claude",
             Some("chan-a"),
             json!({"baseUrl": "https://a.example/v1", "apiKey": "sk-a", "model": "m-a"}),
         );
         let channel = first_usable_channel(None).unwrap();
         assert_eq!(channel.engine, "claude");
-        assert_eq!(channel.base_url, "https://a.example/v1");
-        assert_eq!(channel.api_key, "sk-a");
-        assert_eq!(channel.model.as_deref(), Some("m-a"));
-        assert_eq!(chat_endpoint(&channel), "https://a.example/v1/messages");
+        assert_eq!(channel.wire.kind, "anthropic");
+        assert_eq!(channel.wire.base_url, "https://a.example/v1");
+        assert_eq!(channel.wire.api_key, "sk-a");
+        assert_eq!(channel.wire.model, "m-a");
+    }
+
+    #[test]
+    fn claude_alias_model_maps_through_the_channel_slots() {
+        let scratch = HomeScratch::new();
+        // The UI's opus/sonnet aliases are not model ids; a relay answers
+        // "unknown model" for them. The slot env carries the real id.
+        scratch.seed(
+            "claude",
+            Some("chan-a"),
+            json!({
+                "baseUrl": "https://a.example/v1",
+                "apiKey": "sk-a",
+                "model": "opus",
+                "settingsConfig": {"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-1"}}
+            }),
+        );
+        let channel = first_usable_channel(Some("claude")).unwrap();
+        assert_eq!(channel.wire.model, "claude-opus-4-1");
+    }
+
+    #[test]
+    fn codex_responses_channels_resolve_to_the_responses_wire() {
+        let scratch = HomeScratch::new();
+        scratch.seed(
+            "codex",
+            Some("chan-a"),
+            json!({
+                "baseUrl": "https://c.example",
+                "apiKey": "sk-c",
+                "model": "gpt-5",
+                "configToml": "model_provider = \"chan-a\"\nwire_api = \"responses\""
+            }),
+        );
+        let channel = first_usable_channel(Some("codex")).unwrap();
+        assert_eq!(channel.wire.kind, "openai-responses");
+        assert_eq!(channel.wire.model, "gpt-5");
     }
 
     #[test]
     fn channel_lookup_skips_channels_without_a_credential() {
         let scratch = HomeScratch::new();
         // Current channel has a base URL but no key: not usable, and there is
-        // nothing else to fall back to.
-        scratch.seed(Some("chan-a"), json!({"baseUrl": "https://a.example"}));
-        assert_eq!(first_usable_channel(None).unwrap_err(), NO_CHANNEL_ERROR);
+        // nothing else to fall back to. The scan report names the reason.
+        scratch.seed("claude", Some("chan-a"), json!({"baseUrl": "https://a.example"}));
+        let error = first_usable_channel(None).unwrap_err();
+        assert!(error.starts_with("未找到可用渠道"), "error was: {error}");
+        assert!(error.contains("no API key"), "error was: {error}");
+    }
+
+    #[test]
+    fn explicit_engine_without_a_channel_fails_loudly() {
+        let scratch = HomeScratch::new();
+        scratch.seed(
+            "claude",
+            Some("chan-a"),
+            json!({"baseUrl": "https://a.example", "apiKey": "sk-a", "model": "m-a"}),
+        );
+        // Kimi has no channel at all: asking for it must not silently reroute
+        // to the configured Claude channel.
+        let error = first_usable_channel(Some("kimi")).unwrap_err();
+        assert!(error.contains("引擎 kimi"), "error was: {error}");
+    }
+
+    #[test]
+    fn selected_scope_describes_exactly_the_checked_paths() {
+        let scratch = Scratch::new();
+        let repo = git2::Repository::init(&scratch.0).unwrap();
+        commit_file(&repo, "a.txt", "a\n");
+        commit_file(&repo, "b.txt", "b\n");
+        // Both staged; only a.txt is checked. The commit button would unstage
+        // b.txt, so the message must not describe it.
+        std::fs::write(scratch.0.join("a.txt"), "a staged\n").unwrap();
+        std::fs::write(scratch.0.join("b.txt"), "b staged\n").unwrap();
+        stage(&repo, "a.txt");
+        stage(&repo, "b.txt");
+
+        let context = build_context(&repo, Some(&["a.txt".to_string()])).unwrap();
+        assert_eq!(context.scope, DiffScope::Selected);
+        assert!(context.files.contains("a.txt"), "files: {}", context.files);
+        assert!(!context.files.contains("b.txt"), "files: {}", context.files);
+        assert!(context.diff.contains("+a staged"), "diff: {}", context.diff);
+        assert!(!context.diff.contains("b staged"), "diff: {}", context.diff);
+    }
+
+    #[test]
+    fn selected_scope_covers_checked_unstaged_and_untracked_files() {
+        let scratch = Scratch::new();
+        let repo = git2::Repository::init(&scratch.0).unwrap();
+        commit_file(&repo, "a.txt", "a\n");
+        // Checked but not yet staged: the commit stages them first, so the
+        // message must cover both — the worktree edit and the new file.
+        std::fs::write(scratch.0.join("a.txt"), "a changed\n").unwrap();
+        std::fs::write(scratch.0.join("fresh.txt"), "brand new content\n").unwrap();
+
+        let selection = vec!["a.txt".to_string(), "fresh.txt".to_string()];
+        let context = build_context(&repo, Some(&selection)).unwrap();
+        assert_eq!(context.scope, DiffScope::Selected);
+        assert!(context.files.contains("a.txt"), "files: {}", context.files);
+        assert!(context.files.contains("?? fresh.txt"), "files: {}", context.files);
+        assert!(context.diff.contains("+a changed"), "diff: {}", context.diff);
+        // Untracked content stays out of the budget; the path is listed.
+        assert!(context.diff.contains("fresh.txt"), "diff: {}", context.diff);
+        assert!(!context.diff.contains("brand new content"));
+    }
+
+    #[test]
+    fn selected_scope_without_matching_paths_is_an_error() {
+        let scratch = Scratch::new();
+        let repo = git2::Repository::init(&scratch.0).unwrap();
+        commit_file(&repo, "a.txt", "a\n");
+        assert_eq!(
+            build_context(&repo, Some(&["gone.txt".to_string()])).unwrap_err(),
+            "没有可提交的变更"
+        );
     }
 }

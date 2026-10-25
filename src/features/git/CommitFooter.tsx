@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Sparkles from "lucide-react/dist/esm/icons/sparkles";
 import { Button } from "@/components/base/buttons/button";
 import { cx } from "@/utils/cx";
-import { ipc } from "@/lib/ipc";
+import { ipc, type CommitMessageChannel } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
+import { useChatStore } from "@/features/chat/store";
 import { useGitStore } from "./store";
 
 interface CommitFooterProps {
@@ -17,6 +18,9 @@ interface CommitFooterProps {
   run: (key: string, action: () => Promise<unknown>) => void;
   /** Total files currently selected for commit */
   selectedCount?: number;
+  /** The checked paths the commit button would commit; the AI draft describes
+   *  exactly this set so the title cannot lie about the commit's content. */
+  selectedFiles?: ReadonlySet<string>;
   /** Custom handler when committing selected files (auto-stages selected before commit) */
   onCommitSelected?: () => Promise<void>;
 }
@@ -30,11 +34,34 @@ export function CommitFooter({
   onCommitMsgChange,
   run,
   selectedCount,
+  selectedFiles,
   onCommitSelected,
 }: CommitFooterProps) {
   const { t, i18n } = useTranslation();
   const [drafting, setDrafting] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
+  // Generation goes through the current chat engine's channel — never a
+  // silently picked third party. The tooltip names the engine and the
+  // channel host, so the user sees where the repo diff would be sent.
+  const activeEngine = useChatStore((s) => s.activeEngine);
+  const [channel, setChannel] = useState<CommitMessageChannel | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    ipc
+      .gitCommitMessageChannel(activeEngine)
+      .then((info) => {
+        if (!cancelled) setChannel(info);
+      })
+      .catch(() => {
+        if (!cancelled) setChannel(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeEngine]);
+  // The commit button commits the checked set; the draft must describe the
+  // same set, so generation follows the selection, not the raw index.
+  const committableCount = selectedCount ?? stagedCount;
   return (
     <div className="flex flex-col gap-2 border-t border-separator-border p-3">
       <textarea
@@ -58,13 +85,26 @@ export function CommitFooter({
           variant="secondary"
           size="small"
           className="shrink-0"
-          disabled={stagedCount === 0 || busy || drafting}
+          title={
+            channel
+              ? t("git.generateCommitMessageHint", {
+                  engine: channel.engine,
+                  host: channel.baseUrl,
+                })
+              : t("git.generateCommitMessageNoChannel", { engine: activeEngine })
+          }
+          disabled={committableCount === 0 || busy || drafting}
           onClick={() => {
             setDrafting(true);
             setDraftError(null);
             void ipc
-              .gitGenerateCommitMessage(workspacePath, null, i18n.language)
-              .then((message) => {
+              .gitGenerateCommitMessage(
+                workspacePath,
+                activeEngine,
+                i18n.language,
+                selectedFiles ? Array.from(selectedFiles) : null,
+              )
+              .then(({ message }) => {
                 if (message.trim()) onCommitMsgChange(message.trim());
               })
               .catch((err: unknown) => setDraftError(errorText(err)))
