@@ -11,19 +11,24 @@ vi.mock("react-i18next", async (importOriginal) => ({
   useTranslation: () => ({ t: (key: string) => key, i18n: { language: "zh-CN" } }),
 }));
 vi.mock("./ChangesPanelHeader", () => ({
-  ChangesPanelHeader: ({ workspacePath }: { workspacePath: string }) => (
-    <header data-testid={`header-${workspacePath}`}>{workspacePath}</header>
+  ChangesPanelHeader: ({ workspacePath, error }: { workspacePath: string; error?: string }) => (
+    <header data-testid={`header-${workspacePath}`}>{workspacePath}{error}</header>
   ),
 }));
 vi.mock("./CommitFooter", () => ({
-  CommitFooter: ({ workspacePath, stagedCount, onCommitMsgChange }: {
+  CommitFooter: ({ workspacePath, stagedCount, commitMsg, busy, onCommitMsgChange, onCommitSelected }: {
     workspacePath: string;
     stagedCount: number;
+    commitMsg: string;
+    busy: boolean;
     onCommitMsgChange: (value: string) => void;
+    onCommitSelected: () => Promise<void>;
   }) => (
     <footer data-testid={`footer-${workspacePath}`}>
       <span>{`staged:${stagedCount}`}</span>
+      <textarea value={commitMsg} readOnly />
       <button onClick={() => onCommitMsgChange("draft")}>write draft</button>
+      <button data-commit disabled={busy} onClick={() => void onCommitSelected()}>commit</button>
     </footer>
   ),
 }));
@@ -55,6 +60,8 @@ describe("ChangesPanel multi-project view", () => {
   const commit = vi.fn().mockResolvedValue("sha");
   const stage = vi.fn().mockResolvedValue(undefined);
   const discoverRepos = vi.fn().mockResolvedValue(undefined);
+  const refresh = vi.fn().mockResolvedValue(undefined);
+  const loadBranches = vi.fn().mockResolvedValue(undefined);
 
   beforeEach(() => {
     stage.mockResolvedValue(undefined);
@@ -70,14 +77,16 @@ describe("ChangesPanel multi-project view", () => {
     );
     useGitStore.setState({
       reposByWorkspace: { "/ws": SUMMARIES },
+      reposRevisionByWorkspace: {},
+      statusRevisionByWorkspace: {},
       statusByWorkspace: {
         "/ws": undefined,
         "/ws/api": { branch: "main", ahead: 0, behind: 0, staged: [{ path: "a.ts", status: "M" }], unstaged: [], untracked: [] },
         "/ws/web": { branch: "feat/ui", ahead: 2, behind: 0, staged: [], unstaged: [{ path: "b.ts", status: "M" }], untracked: [{ path: "c.ts", status: "??" }] },
         "/ws/docs": { branch: "main", ahead: 0, behind: 0, staged: [], unstaged: [], untracked: [] },
       },
-      refresh: vi.fn().mockResolvedValue(undefined),
-      loadBranches: vi.fn().mockResolvedValue(undefined),
+      refresh,
+      loadBranches,
       discoverRepos,
       stage,
       unstage: vi.fn().mockResolvedValue(undefined),
@@ -100,13 +109,36 @@ describe("ChangesPanel multi-project view", () => {
   });
 
   it("lists every project under the workspace, each with its own section", () => {
+    // Dirty projects mount their panels; the clean one stays folded with
+    // only its section header, so first open does not refresh it.
     const headers = [...container.querySelectorAll("[data-testid^='header-']")]
       .map((n) => n.getAttribute("data-testid"));
-    expect(headers).toEqual(["header-/ws/api", "header-/ws/web", "header-/ws/docs"]);
+    expect(headers).toEqual(["header-/ws/api", "header-/ws/web"]);
     // One scrollbar walks all projects, as in IDEA's unified change list.
     expect(container.querySelectorAll(".overflow-y-auto")).toHaveLength(1);
     expect(container.textContent).toContain("api");
     expect(container.textContent).toContain("feat/ui");
+    // Folded does not mean gone: the clean project keeps its section row.
+    expect(container.textContent).toContain("docs");
+  });
+
+  it("loads a clean project only once its section is expanded", async () => {
+    // /ws/docs has no changes, so opening the tab must not fire a status
+    // walk for it — a wide workspace would otherwise stall on N IPC calls.
+    expect(refresh).toHaveBeenCalledWith("/ws/api");
+    expect(refresh).toHaveBeenCalledWith("/ws/web");
+    expect(refresh).not.toHaveBeenCalledWith("/ws/docs");
+    expect(loadBranches).not.toHaveBeenCalledWith("/ws/docs");
+    expect(container.querySelector("[data-testid='footer-/ws/docs']")).toBeNull();
+
+    const docsToggle = [...container.querySelectorAll<HTMLButtonElement>("section > button")]
+      .find((button) => button.textContent?.includes("docs"))!;
+    await act(async () => docsToggle.click());
+
+    expect(container.querySelector("[data-testid='header-/ws/docs']")).not.toBeNull();
+    expect(container.querySelector("[data-testid='footer-/ws/docs']")).not.toBeNull();
+    expect(refresh).toHaveBeenCalledWith("/ws/docs");
+    expect(loadBranches).toHaveBeenCalledWith("/ws/docs");
   });
 
   it("scopes each project's row actions and commit box to that repository", async () => {
@@ -126,14 +158,55 @@ describe("ChangesPanel multi-project view", () => {
   });
 
   it("folds one project without disturbing the others", async () => {
-    const before = container.querySelectorAll("li").length;
+    const section = container.querySelector("[data-testid='header-/ws/web']")!.closest("section")!;
     await act(async () => {
       container.querySelector<HTMLButtonElement>("[data-testid='header-/ws/web']")!
         .closest("section")!.querySelector<HTMLButtonElement>("button")!.click();
     });
-    expect(container.querySelectorAll("li").length).toBeLessThan(before);
-    expect(container.querySelector("[data-testid='footer-/ws/web']")).toBeNull();
+    expect(section.querySelector('[aria-hidden="true"][inert]')).not.toBeNull();
+    expect(section.querySelector("button")!.getAttribute("aria-expanded")).toBe("false");
     expect(container.querySelector("[data-testid='footer-/ws/api']")).not.toBeNull();
+  });
+
+  it("preserves a project's draft and selection across collapse and reopen", async () => {
+    const footer = container.querySelector("[data-testid='footer-/ws/api']")!;
+    const toggle = footer.closest("section")!.querySelector<HTMLButtonElement>("button")!;
+    act(() => footer.querySelector<HTMLButtonElement>("button")!.click());
+    await act(async () => toggle.click());
+    await act(async () => toggle.click());
+    expect(container.querySelector<HTMLTextAreaElement>("[data-testid='footer-/ws/api'] textarea")!.value).toBe("draft");
+    await act(async () => container.querySelector<HTMLButtonElement>("[data-testid='footer-/ws/api'] [data-commit]")!.click());
+    expect(commit).toHaveBeenCalledWith("/ws/api", "draft");
+  });
+
+  it("keeps a pending commit locked across collapse and reports its eventual failure", async () => {
+    let reject!: (error: Error) => void;
+    commit.mockImplementationOnce(() => new Promise((_, no) => { reject = no; }));
+    const footer = container.querySelector("[data-testid='footer-/ws/api']")!;
+    const toggle = footer.closest("section")!.querySelector<HTMLButtonElement>("button")!;
+    act(() => footer.querySelector<HTMLButtonElement>("button")!.click());
+    await act(async () => footer.querySelector<HTMLButtonElement>("[data-commit]")!.click());
+    await act(async () => toggle.click());
+    await act(async () => toggle.click());
+    expect(container.querySelector<HTMLButtonElement>("[data-testid='footer-/ws/api'] [data-commit]")!.disabled).toBe(true);
+    await act(async () => reject(new Error("commit failed")));
+    expect(container.querySelector<HTMLButtonElement>("[data-testid='footer-/ws/api'] [data-commit]")!.disabled).toBe(false);
+    expect(container.querySelector("[data-testid='header-/ws/api']")!.textContent).toContain("commit failed");
+    expect(container.querySelector<HTMLTextAreaElement>("[data-testid='footer-/ws/api'] textarea")!.value).toBe("draft");
+  });
+
+  it("preserves checked unstaged files when reopening a repository", async () => {
+    const footer = container.querySelector("[data-testid='footer-/ws/web']")!;
+    const section = footer.closest("section")!;
+    const toggle = section.querySelector<HTMLButtonElement>("button")!;
+    act(() => section.querySelector<HTMLInputElement>('input[aria-label="b.ts"]')!.click());
+    act(() => footer.querySelector<HTMLButtonElement>("button")!.click());
+    await act(async () => toggle.click());
+    await act(async () => toggle.click());
+    expect(section.querySelector<HTMLInputElement>('input[aria-label="b.ts"]')!.checked).toBe(true);
+    await act(async () => section.querySelector<HTMLButtonElement>("[data-commit]")!.click());
+    expect(stage).toHaveBeenCalledWith("/ws/web", ["b.ts"]);
+    expect(commit).toHaveBeenCalledWith("/ws/web", "draft");
   });
 
   it("keeps the single-repository panel when a repository is pinned", () => {

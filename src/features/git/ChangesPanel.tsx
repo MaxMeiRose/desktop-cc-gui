@@ -327,6 +327,9 @@ export function ChangesPanel({
   const repositories = useGitStore((s) =>
     repoPath === undefined ? s.reposByWorkspace[workspacePath] : undefined,
   );
+  const discoveryRevision = useGitStore((s) =>
+    repoPath === undefined ? s.reposRevisionByWorkspace[workspacePath] ?? 0 : 0,
+  );
   // Discovery already reports the workspace root when the root is itself a
   // repository, so the summaries are the whole list of projects. More than
   // one project is the only case that needs sections: a workspace holding a
@@ -352,6 +355,7 @@ export function ChangesPanel({
       <RepoChangesPanel
         workspacePath={workspacePath}
         repoPath={pinnedRepoPath}
+        discoveryRevision={discoveryRevision}
         className={className}
         visible={visible}
       />
@@ -366,10 +370,17 @@ export function ChangesPanel({
           workspace, and each section's group headers stick to it. */}
       <div ref={setScroller} className="min-h-0 flex-1 overflow-y-auto">
         {repos.map((path) => (
-          <RepoSection key={path} repoPath={path}>
+          // Clean sections start folded: every mounted panel refreshes its
+          // repository over IPC, so a workspace holding dozens of projects
+          // must not fire a status walk per project on first open. A dirty
+          // section still opens itself, and expanding a folded one mounts
+          // the panel, which loads that repository on demand. After first
+          // expansion it stays mounted so folding cannot drop pending work.
+          <RepoSection key={path} workspacePath={workspacePath} repoPath={path} defaultOpen={false}>
             <RepoChangesPanel
               workspacePath={workspacePath}
               repoPath={path}
+              discoveryRevision={discoveryRevision}
               visible={visible}
               embedded
               sharedScrollElement={scroller}
@@ -393,6 +404,7 @@ function RepoChangesPanel({
   visible = true,
   embedded = false,
   sharedScrollElement,
+  discoveryRevision = 0,
 }: {
   workspacePath: string;
   /** Pin the panel to this repository instead of following the file tree's
@@ -407,6 +419,7 @@ function RepoChangesPanel({
   /** Shared scroller for embedded sections (their group headers stick to
    *  it); a standalone panel passes nothing and owns its scroller. */
   sharedScrollElement?: HTMLDivElement | null;
+  discoveryRevision?: number;
 }) {
   const { t } = useTranslation();
   const selectedPath = useFilesStore((s) => s.selectedPath);
@@ -470,7 +483,7 @@ function RepoChangesPanel({
     if (!visible) return;
     void useGitStore.getState().refresh(gitWorkspacePath);
     void useGitStore.getState().loadBranches(gitWorkspacePath);
-  }, [gitWorkspacePath, visible]);
+  }, [gitWorkspacePath, visible, discoveryRevision]);
 
   const header = visible ? (
     <ChangesPanelHeader

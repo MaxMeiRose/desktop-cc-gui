@@ -460,7 +460,9 @@ fn render_selected_diff(
         let mut opts = git2::DiffOptions::new();
         // Same three context lines as `git diff`, same rationale as
         // render_diff: without them the +/- markers vanish.
-        opts.context_lines(3);
+        // Checkbox paths are literal file names, not glob patterns (for
+        // example a Next.js route named [id].tsx must not include i.tsx).
+        opts.context_lines(3).disable_pathspec_match(true);
         for path in tracked {
             opts.pathspec(path);
         }
@@ -1234,5 +1236,19 @@ mod tests {
             build_context(&repo, Some(&["gone.txt".to_string()])).unwrap_err(),
             "没有可提交的变更"
         );
+    }
+
+    #[test]
+    fn selected_scope_treats_brackets_as_literal_path_characters() {
+        let scratch = Scratch::new();
+        let repo = git2::Repository::init(&scratch.0).unwrap();
+        commit_file(&repo, "[id].tsx", "route base\n");
+        commit_file(&repo, "i.tsx", "other base\n");
+        std::fs::write(scratch.0.join("[id].tsx"), "selected route change\n").unwrap();
+        std::fs::write(scratch.0.join("i.tsx"), "unchecked content\n").unwrap();
+        let context = build_context(&repo, Some(&["[id].tsx".to_string()])).unwrap();
+        assert!(context.diff.contains("+selected route change"), "{}", context.diff);
+        assert!(!context.diff.contains("unchecked content"), "{}", context.diff);
+        assert!(!context.diff.contains("b/i.tsx"), "{}", context.diff);
     }
 }

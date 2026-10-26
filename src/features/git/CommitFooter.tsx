@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Sparkles from "lucide-react/dist/esm/icons/sparkles";
 import { Button } from "@/components/base/buttons/button";
@@ -44,6 +44,19 @@ export function CommitFooter({
   // silently picked third party. The tooltip names the engine and the
   // channel host, so the user sees where the repo diff would be sent.
   const activeEngine = useChatStore((s) => s.activeEngine);
+  const generation = useRef(0);
+  const selectionKey = JSON.stringify(selectedFiles ? [...selectedFiles].sort() : null);
+  const invalidateDraft = useCallback(() => {
+    generation.current += 1;
+    setDrafting(false);
+    setDraftError(null);
+  }, []);
+  // Invalidate on the committed UI change, before any pending promise can
+  // write into a different repository, selection or user-edited draft.
+  useLayoutEffect(() => {
+    invalidateDraft();
+    return () => { generation.current += 1; };
+  }, [workspacePath, activeEngine, i18n.language, selectionKey, commitMsg, busy, invalidateDraft]);
   const [channel, setChannel] = useState<CommitMessageChannel | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -66,7 +79,10 @@ export function CommitFooter({
     <div className="flex flex-col gap-2 border-t border-separator-border p-3">
       <textarea
         value={commitMsg}
-        onChange={(e) => onCommitMsgChange(e.target.value)}
+        onChange={(e) => {
+          invalidateDraft();
+          onCommitMsgChange(e.target.value);
+        }}
         placeholder={t("git.commitMessage")}
         rows={2}
         className={cx(
@@ -95,6 +111,7 @@ export function CommitFooter({
           }
           disabled={committableCount === 0 || busy || drafting}
           onClick={() => {
+            const request = ++generation.current;
             setDrafting(true);
             setDraftError(null);
             void ipc
@@ -105,10 +122,16 @@ export function CommitFooter({
                 selectedFiles ? Array.from(selectedFiles) : null,
               )
               .then(({ message }) => {
-                if (message.trim()) onCommitMsgChange(message.trim());
+                if (request === generation.current && message.trim()) {
+                  onCommitMsgChange(message.trim());
+                }
               })
-              .catch((err: unknown) => setDraftError(errorText(err)))
-              .finally(() => setDrafting(false));
+              .catch((err: unknown) => {
+                if (request === generation.current) setDraftError(errorText(err));
+              })
+              .finally(() => {
+                if (request === generation.current) setDrafting(false);
+              });
           }}
         >
           <Sparkles aria-hidden className="size-4" />
@@ -122,6 +145,7 @@ export function CommitFooter({
             busy
           }
           onClick={() => {
+            invalidateDraft();
             if (onCommitSelected) {
               void onCommitSelected();
             } else {

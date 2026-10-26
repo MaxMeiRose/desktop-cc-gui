@@ -358,6 +358,8 @@ cannot see: one section per project inside ONE scroller, each project's commit
 box living in its own section rather than one panel-wide footer, row actions
 scoped to the repository that owns the row (web's two stage actions report
 `/web`, never a sibling), the last project reachable by scrolling, and folding
-one project leaving the others untouched. It reports PASS with the section and
+one project leaving the others untouched. The clean repository loads on first
+expansion; folding a visited repository clips its body and marks it inert,
+while reopening preserves its draft and input identity. It reports PASS with the section and
 scroller counts plus the recorded stage calls. Real `ChangesPanel`; only the
 store's IPC actions are stubbed. No app, no backend.

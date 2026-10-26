@@ -4,6 +4,7 @@ import FolderGit2 from "lucide-react/dist/esm/icons/folder-git-2";
 import ChevronDown from "lucide-react/dist/esm/icons/chevron-down";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
 import { cx } from "@/utils/cx";
+import { Collapsible } from "@/components/application/collapsible/collapsible";
 import { useGitStore } from "./store";
 
 /** Trailing folder name of a repository path, on either path separator. */
@@ -11,61 +12,62 @@ export function repoDisplayName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 }
 
-/** Per-repository change counts shown in the section header: live status once
- *  it lands, the discovery summary before that, undefined while both are
- *  still in flight. */
-function useRepoCounts(repoPath: string) {
+/** Use the newest successful snapshot, scoped to this workspace's scan. */
+function useRepoCounts(workspacePath: string, repoPath: string) {
   const status = useGitStore((s) => s.statusByWorkspace[repoPath]);
-  const summary = useGitStore((s) => {
-    const status_ = s.statusByWorkspace[repoPath];
-    if (status_) return undefined;
-    for (const list of Object.values(s.reposByWorkspace)) {
-      const hit = list?.find((repo) => repo.path === repoPath);
-      if (hit) return hit;
-    }
-    return undefined;
-  });
+  const summary = useGitStore((s) => s.reposByWorkspace[workspacePath]?.find((repo) => repo.path === repoPath));
+  const statusRevision = useGitStore((s) => s.statusRevisionByWorkspace[repoPath] ?? 0);
+  const summaryRevision = useGitStore((s) => s.reposRevisionByWorkspace[workspacePath] ?? 0);
   if (!status && !summary) return undefined;
-  const changed = status
-    ? status.staged.length + status.unstaged.length
+  const currentStatus = status && (!summary || statusRevision >= summaryRevision) ? status : undefined;
+  const changed = currentStatus
+    ? currentStatus.staged.length + currentStatus.unstaged.length
     : (summary?.changed ?? 0);
-  const untracked = status ? status.untracked.length : (summary?.untracked ?? 0);
+  const untracked = currentStatus ? currentStatus.untracked.length : (summary?.untracked ?? 0);
   return {
     changed,
     untracked,
     total: changed + untracked,
-    branch: status?.branch ?? summary?.branch ?? "",
+    branch: currentStatus?.branch ?? summary?.branch ?? "",
+    ahead: currentStatus?.ahead,
+    behind: currentStatus?.behind,
   };
 }
 
 /**
  * One repository's block in the multi-project changes view: name, branch,
  * ahead/behind and change counts, folding that repository's whole panel
- * (groups + commit box) in and out. Repositories with nothing changed stay
- * visible and open too — a clean branch is information, and a list that
- * shrinks is what makes users hunt for where a project went. Only an
- * explicit toggle folds a section.
+ * (groups + commit box) in and out. The panel mounts on first expansion and
+ * stays mounted to preserve drafts and pending actions. The
+ * caller picks `defaultOpen` to keep clean projects folded instead of
+ * firing one status walk per project on first open. A repository with
+ * changes opens itself regardless of the hint, and a folded section stays
+ * listed: a clean branch is information, and a list that shrinks is what
+ * makes users hunt for where a project went.
  *
  * `defaultOpen` is a hint, not a rule: the effective open flag folds the
  * user's own collapse over the hint, so an explicit toggle always wins.
  */
 export function RepoSection({
+  workspacePath,
   repoPath,
   defaultOpen = true,
   children,
 }: {
+  workspacePath: string;
   repoPath: string;
   defaultOpen?: boolean;
   children: React.ReactNode;
 }) {
   const { t } = useTranslation();
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const branch = useGitStore((s) => s.statusByWorkspace[repoPath]?.branch);
-  const ahead = useGitStore((s) => s.statusByWorkspace[repoPath]?.ahead);
-  const behind = useGitStore((s) => s.statusByWorkspace[repoPath]?.behind);
-  const counts = useRepoCounts(repoPath);
+  const counts = useRepoCounts(workspacePath, repoPath);
+  const ahead = counts?.ahead;
+  const behind = counts?.behind;
   const dirty = counts !== undefined && counts.total > 0;
   const open = userOpen ?? (defaultOpen || dirty);
+  const [mounted, setMounted] = useState(open);
+  if (open && !mounted) setMounted(true);
   return (
     <section className="border-b border-separator-border last:border-b-0">
       <button
@@ -84,7 +86,7 @@ export function RepoSection({
           {repoDisplayName(repoPath)}
         </span>
         <span className="min-w-0 truncate text-caption-1-regular text-text-tertiary">
-          {branch ?? counts?.branch ?? ""}
+          {counts?.branch ?? ""}
         </span>
         {ahead !== undefined && behind !== undefined && (ahead > 0 || behind > 0) && (
           <span className="shrink-0 text-caption-1-regular text-text-tertiary">
@@ -109,7 +111,11 @@ export function RepoSection({
           )}
         </span>
       </button>
-      {open && <div className="flex flex-col">{children}</div>}
+      <div aria-hidden={!open} {...(!open ? { inert: "" } : {})}>
+        <Collapsible open={open} seconds={0.2} className="motion-reduce:!transition-none">
+          {mounted ? <div className="flex flex-col">{children}</div> : null}
+        </Collapsible>
+      </div>
     </section>
   );
 }

@@ -135,6 +135,11 @@ async function main() {
   if (scrollers.length !== 1) fail(`expected one scrolling list, got ${scrollers.length}`);
   const scroller = scrollers[0];
 
+  // The clean repository is lazy: first expansion creates its panel.
+  if (sections[2].querySelector("textarea")) fail("clean repository was not loaded lazily");
+  await press(sectionFor("docs"));
+  await sleep(220);
+
   // 3. Per-project commit boxes: the staged-only project offers a live commit
   //    button, the clean one is disabled, and each sits inside its own
   //    section rather than a single panel-wide footer.
@@ -149,10 +154,12 @@ async function main() {
   // 4. Row actions are scoped to the repository that owns the row. `web` is
   //    the only project with worktree changes — one unstaged row and one
   //    untracked row, so exactly two stage actions, both targeting `web`.
-  const stageButtons = document.querySelectorAll('li button[aria-label="暂存"]');
-  if (stageButtons.length !== 2) {
-    fail(`expected web's two stage actions, got ${stageButtons.length}`);
-  }
+  const stageButtons = ["src/web.txt", "src/new.txt"].map((path) => {
+    const row = sections[1].querySelector(`input[aria-label="${path}"]`)?.closest("li");
+    const button = row?.querySelector('button[aria-label="暂存"]');
+    if (!button) fail(`missing file stage action for ${path}`);
+    return button;
+  });
   for (const button of stageButtons) await press(button);
   if (stageCalls.length !== 2) fail(`expected 2 stage calls, got ${stageCalls.length}`);
   for (const call of stageCalls) {
@@ -176,13 +183,27 @@ async function main() {
   }
 
   // 6. Folding one project hides only that project's body. Folding api must
-  //    leave web's rows on screen, and re-opening must restore api's own.
+  //    preserve its draft and DOM identity while making its body inaccessible.
   const apiHeader = sectionFor("api");
+  const apiDraft = sections[0].querySelector("textarea")!;
+  const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+  setValue.call(apiDraft, "fix: preserve my draft");
+  apiDraft.dispatchEvent(new Event("input", { bubbles: true }));
+  await sleep(50);
   await press(apiHeader);
-  if (sections[0].querySelector("li")) fail("folding api left its rows mounted");
+  await sleep(220);
+  const hiddenBody = sections[0].querySelector<HTMLElement>('[aria-hidden="true"][inert]');
+  if (!hiddenBody) fail("folding api did not remove its body from keyboard and accessibility navigation");
+  if (apiDraft.getBoundingClientRect().height > 0 && hiddenBody.getBoundingClientRect().height > 1) {
+    fail("folding api left its body visible in the layout");
+  }
   if (!sections[1].querySelector("li")) fail("folding api also removed web's rows");
   await press(apiHeader);
+  await sleep(220);
   if (!sections[0].querySelector("li")) fail("re-opening api did not restore its rows");
+  if (sections[0].querySelector("textarea") !== apiDraft || apiDraft.value !== "fix: preserve my draft") {
+    fail("folding api discarded its draft or recreated its input");
+  }
 
   document.getElementById("readout")!.textContent =
     `PASS sections=${sections.length} scrollers=${scrollers.length} ` +
