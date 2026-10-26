@@ -21,6 +21,10 @@ use crate::provider_files::channel_field;
 /// window and stall the request for no gain.
 const MAX_DIFF_CHARS: usize = 24_000;
 const DIFF_TRUNCATION_NOTE: &str = "… diff truncated …";
+/// Per-file cap for untracked content: large enough to show what a new file
+/// is, small enough that a few fresh files cannot crowd out the tracked
+/// diff. Binary or oversized files still list by path only.
+const MAX_UNTRACKED_FILE_CHARS: usize = 4_096;
 /// Model output budget: a commit message is a subject plus at most a short
 /// body, so anything longer is the model rambling.
 const MAX_MESSAGE_CHARS: usize = 500;
@@ -240,7 +244,10 @@ fn origin_marker(origin: char) -> &'static str {
     }
 }
 
-fn append_patch(diff: &git2::Diff, text: &mut String) -> Result<(), String> {
+/// Append the patch within MAX_DIFF_CHARS. The returned flag reports whether
+/// the budget stopped the print early — the caller appends the truncation
+/// note so the model knows the view is partial.
+fn append_patch(diff: &git2::Diff, text: &mut String) -> Result<bool, String> {
     let mut truncated = false;
     let result = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
         let marker = origin_marker(line.origin());
@@ -256,16 +263,18 @@ fn append_patch(diff: &git2::Diff, text: &mut String) -> Result<(), String> {
         true
     });
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(truncated),
         // Our own stop: git2 maps the `false` return to GIT_EUSER.
-        Err(e) if truncated && e.code() == git2::ErrorCode::User => Ok(()),
+        Err(e) if truncated && e.code() == git2::ErrorCode::User => Ok(true),
         Err(e) => Err(e.to_string()),
     }
 }
 
-/// Render the diff for one scope as patch text within MAX_DIFF_CHARS.
-fn render_diff(repo: &git2::Repository, scope: DiffScope) -> Result<String, String> {
+/// Render the diff for one scope as patch text within MAX_DIFF_CHARS. The
+/// flag reports truncation, so the caller can mark the cut for the model.
+fn render_diff(repo: &git2::Repository, scope: DiffScope) -> Result<(String, bool), String> {
     let mut text = String::new();
+    let mut truncated;
     let mut opts = git2::DiffOptions::new();
     // libgit2 emits no context lines by default, which strips the +/- markers
     // and hands the model file content with no sign of what changed. Three
@@ -280,49 +289,110 @@ fn render_diff(repo: &git2::Repository, scope: DiffScope) -> Result<String, Stri
             let diff = repo
                 .diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))
                 .map_err(|e| e.to_string())?;
-            append_patch(&diff, &mut text)?;
+            truncated = append_patch(&diff, &mut text)?;
         }
         DiffScope::Worktree => {
             let diff = repo
                 .diff_index_to_workdir(None, Some(&mut opts))
                 .map_err(|e| e.to_string())?;
-            append_patch(&diff, &mut text)?;
+            truncated = append_patch(&diff, &mut text)?;
             let untracked: Vec<String> = status_short_lines(repo, scope)?
                 .lines()
                 .filter(|line| line.starts_with("?? "))
-                .map(str::to_string)
+                .map(|line| line[3..].to_string())
                 .collect();
-            if !untracked.is_empty() {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    push_capped(&mut text, "\n");
-                }
-                push_capped(&mut text, "Untracked files (path only):\n");
-                for line in untracked {
-                    if !push_capped(&mut text, &format!("  {line}\n")) {
-                        break;
-                    }
-                }
-            }
+            truncated |= append_untracked_files(repo.workdir(), &mut text, &untracked);
         }
         // build_context routes Selected to selected_context, which renders
         // via render_selected_diff against the exact commit content.
         DiffScope::Selected => unreachable!("selected scope renders via render_selected_diff"),
     }
-    Ok(text)
+    Ok((text, truncated))
+}
+
+/// Untracked files: a small UTF-8 regular file gets its content as `+` lines,
+/// like a new-file patch, so a commit whose whole point is "add these files"
+/// leaves the model more than a file name to describe. Binary, unreadable,
+/// oversized, symlinked, or non-regular files stay path-only, and everything
+/// shares the one MAX_DIFF_CHARS budget with the tracked diff. Returns true
+/// when the budget cut the listing short.
+fn append_untracked_files(
+    workdir: Option<&std::path::Path>,
+    text: &mut String,
+    paths: &[String],
+) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        push_capped(text, "\n");
+    }
+    if !push_capped(text, "Untracked files (small text files include content):\n") {
+        return true;
+    }
+    let mut truncated = false;
+    'files: for path in paths {
+        if !push_capped(text, &format!("?? {path}\n")) {
+            truncated = true;
+            break;
+        }
+        let content = workdir.and_then(|dir| read_untracked_text(dir, path));
+        let Some(content) = content else {
+            continue;
+        };
+        for line in content.lines() {
+            if !push_capped(text, "+") || !push_capped(text, line) || !push_capped(text, "\n") {
+                truncated = true;
+                break 'files;
+            }
+        }
+    }
+    truncated
+}
+
+/// Read an untracked path only when it is a regular file within the per-file
+/// budget. `symlink_metadata` keeps a symlink from pulling a target outside
+/// the worktree into the prompt, and the bounded read avoids loading a huge
+/// file just to discard it.
+fn read_untracked_text(workdir: &std::path::Path, path: &str) -> Option<String> {
+    use std::io::Read;
+
+    let full_path = workdir.join(path);
+    let metadata = std::fs::symlink_metadata(&full_path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_UNTRACKED_FILE_CHARS as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let file = std::fs::File::open(&full_path).ok()?;
+    file.take(MAX_UNTRACKED_FILE_CHARS as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_UNTRACKED_FILE_CHARS {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Mark a diff cut short, so the model is told the view is partial instead
-/// of silently assuming it saw everything.
-pub(crate) fn cap_diff_text(diff: &str) -> String {
-    let mut capped = String::new();
-    if push_capped(&mut capped, diff) {
-        return capped;
+/// of silently assuming it saw everything. The render step's truncation flag
+/// is the only trustworthy signal: the text alone cannot tell "exactly full"
+/// from "cut short", since renderers already stop at MAX_DIFF_CHARS.
+fn with_truncation_note(mut text: String, truncated: bool) -> String {
+    if !truncated {
+        return text;
     }
-    if !capped.is_empty() && !capped.ends_with('\n') {
-        capped.push('\n');
+    // Keep the note inside the budget: cut back to a char boundary that
+    // leaves room for it.
+    let mut room = MAX_DIFF_CHARS.saturating_sub(DIFF_TRUNCATION_NOTE.len());
+    while room > 0 && !text.is_char_boundary(room) {
+        room -= 1;
     }
-    capped.push_str(DIFF_TRUNCATION_NOTE);
-    capped
+    text.truncate(room);
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(DIFF_TRUNCATION_NOTE);
+    text
 }
 
 /// Repository context: the file list plus the diff for the chosen scope.
@@ -366,7 +436,8 @@ fn selected_context(repo: &git2::Repository, paths: &[String]) -> Result<CommitC
         return Err("没有可提交的变更".to_string());
     }
     lines.sort();
-    let diff = cap_diff_text(&render_selected_diff(repo, &tracked, &untracked)?);
+    let (diff, truncated) = render_selected_diff(repo, &tracked, &untracked)?;
+    let diff = with_truncation_note(diff, truncated);
     Ok(CommitContext {
         scope: DiffScope::Selected,
         files: lines.join("\n"),
@@ -376,14 +447,15 @@ fn selected_context(repo: &git2::Repository, paths: &[String]) -> Result<CommitC
 
 /// Patch for the selected tracked paths: HEAD tree → workdir-with-index is
 /// the exact content the commit will carry once the selected paths are
-/// staged. Untracked selections are listed by name only — same budget
-/// rationale as the worktree scope.
+/// staged. Selected untracked files get the same treatment as the worktree
+/// scope: small text content inline, the rest path-only.
 fn render_selected_diff(
     repo: &git2::Repository,
     tracked: &[String],
     untracked: &[String],
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let mut text = String::new();
+    let mut truncated = false;
     if !tracked.is_empty() {
         let mut opts = git2::DiffOptions::new();
         // Same three context lines as `git diff`, same rationale as
@@ -398,20 +470,10 @@ fn render_selected_diff(
         let diff = repo
             .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))
             .map_err(|e| e.to_string())?;
-        append_patch(&diff, &mut text)?;
+        truncated = append_patch(&diff, &mut text)?;
     }
-    if !untracked.is_empty() {
-        if !text.is_empty() && !text.ends_with('\n') {
-            push_capped(&mut text, "\n");
-        }
-        push_capped(&mut text, "Untracked files (path only):\n");
-        for path in untracked {
-            if !push_capped(&mut text, &format!("  ?? {path}\n")) {
-                break;
-            }
-        }
-    }
-    Ok(text)
+    truncated |= append_untracked_files(repo.workdir(), &mut text, untracked);
+    Ok((text, truncated))
 }
 
 pub(crate) fn build_context(
@@ -426,7 +488,8 @@ pub(crate) fn build_context(
     if files.trim().is_empty() {
         return Err("没有可提交的变更".to_string());
     }
-    let diff = cap_diff_text(&render_diff(repo, scope)?);
+    let (diff, truncated) = render_diff(repo, scope)?;
+    let diff = with_truncation_note(diff, truncated);
     Ok(CommitContext { scope, files, diff })
 }
 
@@ -767,20 +830,73 @@ mod tests {
     }
 
     #[test]
-    fn worktree_context_lists_untracked_paths_without_content() {
+    fn worktree_context_includes_small_untracked_content() {
         let scratch = Scratch::new();
         let repo = git2::Repository::init(&scratch.0).unwrap();
         commit_file(&repo, "a.txt", "a\n");
         std::fs::write(scratch.0.join("fresh.txt"), "brand new content\n").unwrap();
+        // Oversized text and non-UTF-8 binary stay path-only: their content
+        // would swamp the diff budget or read as garbage.
+        std::fs::write(
+            scratch.0.join("big.txt"),
+            "oversized marker\n".repeat(MAX_UNTRACKED_FILE_CHARS / 8),
+        )
+        .unwrap();
+        std::fs::write(scratch.0.join("bin.dat"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
         std::fs::write(scratch.0.join("a.txt"), "a changed\n").unwrap();
 
         let context = build_context(&repo, None).unwrap();
         assert_eq!(context.scope, DiffScope::Worktree);
         assert!(context.files.contains("?? fresh.txt"));
         assert!(context.diff.contains("+a changed"), "diff was {:?}", context.diff);
-        assert!(!context.diff.contains("brand new content"));
-        assert!(context.diff.contains("Untracked files (path only)"));
-        assert!(context.diff.contains("fresh.txt"));
+        // A commit whose point is a new file must show that file's content.
+        assert!(context.diff.contains("+brand new content"), "diff was {:?}", context.diff);
+        assert!(context.diff.contains("?? big.txt"), "diff was {:?}", context.diff);
+        assert!(!context.diff.contains("oversized marker"), "diff was {:?}", context.diff);
+        assert!(context.diff.contains("?? bin.dat"), "diff was {:?}", context.diff);
+        assert!(!context.diff.contains(DIFF_TRUNCATION_NOTE), "diff was {:?}", context.diff);
+    }
+
+    #[test]
+    fn untracked_helper_skips_non_regular_paths() {
+        let scratch = Scratch::new();
+        std::fs::create_dir(scratch.0.join("folder")).unwrap();
+        assert!(read_untracked_text(&scratch.0, "folder").is_none());
+    }
+
+    #[test]
+    fn untracked_helper_skips_files_over_the_per_file_budget() {
+        let scratch = Scratch::new();
+        std::fs::write(
+            scratch.0.join("big.txt"),
+            "x".repeat(MAX_UNTRACKED_FILE_CHARS + 1),
+        )
+        .unwrap();
+        assert!(read_untracked_text(&scratch.0, "big.txt").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_symlink_content_stays_out_of_the_prompt() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = Scratch::new();
+        let repo = git2::Repository::init(&scratch.0).unwrap();
+        commit_file(&repo, "a.txt", "a\n");
+        let outside = Scratch::new();
+        std::fs::write(outside.0.join("secret.txt"), "outside secret\n").unwrap();
+        symlink(outside.0.join("secret.txt"), scratch.0.join("link.txt")).unwrap();
+        std::fs::write(scratch.0.join("a.txt"), "a changed\n").unwrap();
+
+        let context = build_context(&repo, None).unwrap();
+        assert_eq!(context.scope, DiffScope::Worktree);
+        assert!(context.files.contains("?? link.txt"), "files: {}", context.files);
+        assert!(context.diff.contains("?? link.txt"), "diff: {}", context.diff);
+        assert!(
+            !context.diff.contains("outside secret"),
+            "diff leaked symlink target: {}",
+            context.diff
+        );
     }
 
     #[test]
@@ -807,25 +923,47 @@ mod tests {
     }
 
     #[test]
-    fn diff_text_is_capped_with_a_visible_note() {
-        let long = "x".repeat(MAX_DIFF_CHARS + 5_000);
-        let capped = cap_diff_text(&long);
-        assert!(capped.ends_with(DIFF_TRUNCATION_NOTE));
-        assert!(capped.len() < long.len());
-        // Short input passes through untouched.
-        let short = "small diff\n";
-        assert_eq!(cap_diff_text(short), short);
+    fn oversized_diff_is_capped_with_a_visible_note() {
+        let scratch = Scratch::new();
+        let repo = git2::Repository::init(&scratch.0).unwrap();
+        commit_file(&repo, "base.txt", "base\n");
+        // One staged file far past the budget: the prompt must say the diff
+        // was cut, not silently describe a partial view.
+        std::fs::write(
+            scratch.0.join("huge.txt"),
+            "x".repeat(MAX_DIFF_CHARS + 5_000),
+        )
+        .unwrap();
+        stage(&repo, "huge.txt");
+
+        let context = build_context(&repo, None).unwrap();
+        assert_eq!(context.scope, DiffScope::Staged);
+        assert!(
+            context.diff.ends_with(DIFF_TRUNCATION_NOTE),
+            "diff tail: {:?}",
+            &context.diff[context.diff.len().saturating_sub(80)..]
+        );
+        assert!(context.diff.len() <= MAX_DIFF_CHARS + 1);
+
+        // An ordinary diff stays untouched: no note, no clipping.
+        let small = Scratch::new();
+        let small_repo = git2::Repository::init(&small.0).unwrap();
+        std::fs::write(small.0.join("a.txt"), "hello\n").unwrap();
+        stage(&small_repo, "a.txt");
+        let context = build_context(&small_repo, None).unwrap();
+        assert!(context.diff.contains("+hello"));
+        assert!(!context.diff.contains(DIFF_TRUNCATION_NOTE));
     }
 
     #[test]
-    fn capping_a_multibyte_diff_never_panics() {
+    fn truncation_note_never_splits_a_multibyte_char() {
         // The budget is in bytes, so the cut can land mid-character — slicing
         // there would panic instead of truncating.
         let cjk = "提".repeat(MAX_DIFF_CHARS);
-        let capped = cap_diff_text(&cjk);
+        let capped = with_truncation_note(cjk, true);
         assert!(capped.ends_with(DIFF_TRUNCATION_NOTE));
         // 24_000 is not a multiple of 3, so alignment genuinely had to move.
-        assert!(capped.len() <= MAX_DIFF_CHARS + DIFF_TRUNCATION_NOTE.len() + 1);
+        assert!(capped.len() <= MAX_DIFF_CHARS + 1);
         let body = capped.strip_suffix(DIFF_TRUNCATION_NOTE).unwrap();
         assert!(body.chars().all(|c| c == '提' || c == '\n'));
     }
@@ -1081,9 +1219,10 @@ mod tests {
         assert!(context.files.contains("a.txt"), "files: {}", context.files);
         assert!(context.files.contains("?? fresh.txt"), "files: {}", context.files);
         assert!(context.diff.contains("+a changed"), "diff: {}", context.diff);
-        // Untracked content stays out of the budget; the path is listed.
-        assert!(context.diff.contains("fresh.txt"), "diff: {}", context.diff);
-        assert!(!context.diff.contains("brand new content"));
+        // A small new file's content ships with the prompt — a commit that
+        // only adds files is otherwise undescribable from paths alone.
+        assert!(context.diff.contains("?? fresh.txt"), "diff: {}", context.diff);
+        assert!(context.diff.contains("+brand new content"), "diff: {}", context.diff);
     }
 
     #[test]
