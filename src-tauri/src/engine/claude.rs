@@ -52,6 +52,11 @@ impl Engine for ClaudeEngine {
         "claude"
     }
 
+    /// Every assistant snapshot names the model that produced it.
+    fn reports_served(&self) -> bool {
+        true
+    }
+
     fn supports_images(&self) -> bool {
         true
     }
@@ -388,6 +393,7 @@ impl Engine for ClaudeEngine {
                         tool,
                         path,
                         message: text,
+                        tool_use_id: id,
                     });
                 }
                 // Tool result output emitted in response to tool_use. The
@@ -459,11 +465,18 @@ impl Engine for ClaudeEngine {
                             .filter(|t| !t.is_empty())
                             .map(str::to_string);
                         let path = denial.get("tool_input").and_then(super::tool_path_arg);
+                        let tool_use_id = denial
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string);
                         if tool.is_some() || path.is_some() {
                             out.push(EngineEvent::PermissionDenied {
                                 tool,
                                 path,
                                 message: String::new(),
+                                tool_use_id,
                             });
                         }
                     }
@@ -1313,6 +1326,72 @@ mod tests {
         }
     }
 
+    /// Live wire: TaskCreate and TaskGet both answer with a `toolUseResult`
+    /// of `{task:{id,subject,...}}`. Only the creation names a new todo id;
+    /// reading a task must not patch the list (it used to reset it to pending).
+    #[test]
+    fn task_create_result_carries_the_id_and_task_get_patches_nothing() {
+        let engine = ClaudeEngine::new();
+        let start = |id: &str, name: &str| {
+            serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
+                }
+            })
+            .to_string()
+        };
+        let answer = |id: &str, envelope: Value, text: &str| {
+            serde_json::json!({
+                "type": "user",
+                "message": { "content": [
+                    { "type": "tool_result", "tool_use_id": id, "content": text }
+                ]},
+                "toolUseResult": envelope
+            })
+            .to_string()
+        };
+        let result_todos = |out: &[EngineEvent]| {
+            out.iter()
+                .find_map(|e| match e {
+                    EngineEvent::Message { patch: true, result: Some(_), todos, .. } => Some(todos.clone()),
+                    _ => None,
+                })
+                .expect("expected a tool result patch")
+        };
+
+        let mut out = Vec::new();
+        engine.parse_line(&start("toolu_c", "TaskCreate"), &mut out);
+        out.clear();
+        engine.parse_line(
+            &answer(
+                "toolu_c",
+                serde_json::json!({"task": {"id": "1", "subject": "A"}}),
+                "Task #1 created successfully: A",
+            ),
+            &mut out,
+        );
+        let created = result_todos(&out).expect("TaskCreate result is a todo fact");
+        assert_eq!(created.items[0].id.as_deref(), Some("1"));
+        assert_eq!(created.items[0].content, "A");
+
+        out.clear();
+        engine.parse_line(&start("toolu_g", "TaskGet"), &mut out);
+        out.clear();
+        engine.parse_line(
+            &answer(
+                "toolu_g",
+                serde_json::json!({"task": {"id": "1", "subject": "A", "description": "",
+                    "status": "completed", "blocks": [], "blockedBy": []}}),
+                "Task #1: A\nStatus: completed\nDescription: ",
+            ),
+            &mut out,
+        );
+        assert!(result_todos(&out).is_none(), "TaskGet must not patch the todo list");
+    }
+
     #[test]
     fn api_retry_system_event_reports_progress_without_settling() {
         let line = serde_json::json!({
@@ -1407,6 +1486,7 @@ mod tests {
                 tool,
                 path,
                 message,
+                ..
             } => {
                 assert_eq!(*tool, None);
                 assert_eq!(path.as_deref(), Some(r"C:\dev\frontend"));
@@ -1465,9 +1545,15 @@ mod tests {
             .find(|e| matches!(e, EngineEvent::PermissionDenied { .. }))
             .expect("expected permission denial");
         match denial {
-            EngineEvent::PermissionDenied { tool, path, .. } => {
+            EngineEvent::PermissionDenied {
+                tool,
+                path,
+                tool_use_id,
+                ..
+            } => {
                 assert_eq!(tool.as_deref(), Some("Read"));
                 assert_eq!(path.as_deref(), Some("/etc/hosts"));
+                assert_eq!(tool_use_id.as_deref(), Some("toolu_9"));
             }
             _ => unreachable!(),
         }
@@ -1519,9 +1605,17 @@ mod tests {
         ClaudeEngine::new().parse_line(&line, &mut out);
         assert_eq!(out.len(), 2);
         match &out[0] {
-            EngineEvent::PermissionDenied { tool, path, .. } => {
+            // The same call's mid-turn copy carries this id too: the
+            // frontend matches the two by it.
+            EngineEvent::PermissionDenied {
+                tool,
+                path,
+                tool_use_id,
+                ..
+            } => {
                 assert_eq!(tool.as_deref(), Some("Read"));
                 assert_eq!(path.as_deref(), Some("/Users/x/secrets/key.pem"));
+                assert_eq!(tool_use_id.as_deref(), Some("toolu_1"));
             }
             _ => panic!("expected permission denial"),
         }

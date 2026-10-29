@@ -98,10 +98,11 @@ export function useChatTabs({
     })),
   );
   // Open file tabs render alongside the session tabs in the center area.
-  const { openFiles, activeFilePath, dirtyPaths, activateFile, clearActiveFile, closeFile, moveOpenFile } =
+  const { openFiles, fileStates, activeFilePath, dirtyPaths, activateFile, clearActiveFile, closeFile, moveOpenFile } =
     useFilesStore(
       useShallow((s) => ({
         openFiles: s.openFiles,
+        fileStates: s.fileStates,
         activeFilePath: s.activeFilePath,
         dirtyPaths: s.dirtyPaths,
         activateFile: s.activateFile,
@@ -229,13 +230,13 @@ export function useChatTabs({
     () =>
       openFiles.map((path) => ({
         key: FILE_TAB_PREFIX + path,
-        label: fileName(path),
-        title: path,
+        label: fileStates[path]?.name ?? fileName(path),
+        title: fileStates[path]?.sourcePath ?? path,
         icon: FileText,
         streaming: false,
         dirty: !!dirtyPaths[path],
       })),
-    [openFiles, dirtyPaths],
+    [openFiles, fileStates, dirtyPaths],
   );
   // Plugin tabs trail the browser tabs in the same strip.
   const pluginTabItems = useMemo(
@@ -754,6 +755,7 @@ function useChatTabHandlers({
   const handleTabCloseInactive = useCallback(
     (targetKey?: string) => {
       const preserve = targetKey ?? activeTabKey;
+      if (!preserve || !tabItems.some((t) => t.key === preserve)) return;
       closeKeys(tabItems.map((t) => t.key).filter((k) => k !== preserve));
     },
     [activeTabKey, closeKeys, tabItems],

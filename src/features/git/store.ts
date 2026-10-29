@@ -54,6 +54,8 @@ interface GitStore {
   pull: (workspacePath: string) => Promise<void>;
   checkout: (workspacePath: string, branch: string) => Promise<void>;
   createBranch: (workspacePath: string, name: string) => Promise<void>;
+  /** `git init`; resolves once status has refreshed out of the non-repo state. */
+  init: (workspacePath: string) => Promise<void>;
 
   /** Repositories discovered under a workspace root, for the panel's
    *  multi-project view. Keyed by the workspace root that was scanned. */
@@ -260,6 +262,17 @@ export const useGitStore = create<GitStore>((set, get) => {
     createBranch: async (workspacePath, name) => {
       await runMutation(workspacePath, () => ipc.gitCreateBranch(workspacePath, name));
       await get().loadBranches(workspacePath);
+    },
+    init: async (workspacePath) => {
+      await runMutation(workspacePath, () => ipc.gitInit(workspacePath));
+      // runMutation's refresh is fire-and-forget; join it (the in-flight map
+      // dedups) so the caller stays busy until the panel leaves NOT_A_REPO.
+      await get().refresh(workspacePath, true);
+      // The dedup can hand back a request sent before the repository existed
+      // (focus / turn-end refresh); its NOT_A_REPO is stale, so ask once more.
+      if (get().notRepoByWorkspace[workspacePath]) {
+        await get().refresh(workspacePath, true);
+      }
     },
   };
 });

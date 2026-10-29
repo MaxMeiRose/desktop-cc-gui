@@ -1707,6 +1707,9 @@ async fn handshake_and_start(
                 comparison_model: None,
                 model: req.model.clone(),
                 effort: req.effort.clone(),
+                // The thread's effective settings follow right below as the
+                // served side.
+                reports_served: true,
             },
         );
     }
@@ -1981,6 +1984,7 @@ pub(crate) async fn run_plan_decision(
     };
     {
         let mut map = state.processes.0.lock().map_err(|e| e.to_string())?;
+        state.processes.ensure_session_not_editing(Some(&thread_id))?;
         if super::registry::active_run_count(&map) >= super::MAX_CONCURRENT_RUNS {
             return Err(format!(
                 "too many concurrent runs ({}); wait for one to finish",
@@ -1988,8 +1992,8 @@ pub(crate) async fn run_plan_decision(
             ));
         }
         map.insert(run_id.clone(), entry.clone());
+        map.entry(thread_id.clone()).or_insert(entry);
     }
-    state.processes.insert_alias(thread_id.clone(), entry);
 
     let core = TurnCore {
         sink: Arc::clone(&state.sink),

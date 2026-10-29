@@ -131,12 +131,15 @@ export interface ChatStore {
    *  handleAddWorkspace）。 */
   addWorkspaces: (paths: string[]) => Promise<string[]>;
   reorderWorkspaces: (ids: string[]) => Promise<void>;
+  setWorkspacePinned: (id: string, pinned: boolean) => Promise<void>;
   removeWorkspace: (id: string) => Promise<void>;
   selectSession: (
     engine: string,
     sessionId: string,
     workspacePath: string,
   ) => Promise<void>;
+  /** Re-read one native transcript without changing the active tab or composer. */
+  reloadSession: (session: SessionMeta) => Promise<void>;
   closeTab: (
     engine: string,
     sessionId: string | null,

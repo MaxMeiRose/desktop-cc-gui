@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/react/shallow";
 import type { ComposerInputHandle } from "@/components/application/ai-chat/ai-chat-composer";
 import { useBrowserStore } from "@/features/browser/store";
+import { useFilesStore } from "@/features/files/store";
 import { useMissionStore } from "@/features/mission/store";
 import { usePluginHubStore } from "@/features/plugins/hub/store";
 import type { AiChatRepo, AiChatRepoSection, ThreadAction } from "@/components/application/ai-chat/ai-chat-sidebar";
@@ -51,13 +52,15 @@ export function useChatSidebar({
     })),
   );
   // Store actions are stable references — one shallow subscription for all.
-  const { selectSession, startNewChat, addWorkspaces, reorderWorkspaces, pinSession, archiveSession, setWorkspaceArchived, assignWorkspaceGroup, createWorkspaceGroup, focusTab, closeTab } =
+  const { selectSession, reloadSession, startNewChat, addWorkspaces, reorderWorkspaces, setWorkspacePinned, pinSession, archiveSession, setWorkspaceArchived, assignWorkspaceGroup, createWorkspaceGroup, focusTab, closeTab } =
     useChatStore(
       useShallow((s) => ({
         selectSession: s.selectSession,
+        reloadSession: s.reloadSession,
         startNewChat: s.startNewChat,
         addWorkspaces: s.addWorkspaces,
         reorderWorkspaces: s.reorderWorkspaces,
+        setWorkspacePinned: s.setWorkspacePinned,
         pinSession: s.pinSession,
         archiveSession: s.archiveSession,
         setWorkspaceArchived: s.setWorkspaceArchived,
@@ -92,10 +95,18 @@ export function useChatSidebar({
         parents.push(w);
       }
     }
-    return { parentWorkspaces: parents, childrenByParent: children };
+    return {
+      parentWorkspaces: [...parents.filter((w) => w.pinned), ...parents.filter((w) => !w.pinned)],
+      childrenByParent: children,
+    };
   }, [visibleWorkspaces]);
 
   const repos: AiChatRepo[] = useMemo(() => {
+    const groups = sortedWorkspaceGroups(workspaceGroups);
+    const groupIds = new Set(groups.map((group) => group.id));
+    const firstWorkspace = parentWorkspaces.find((w) => !w.groupId || !groupIds.has(w.groupId))
+      ?? groups.map((group) => parentWorkspaces.find((w) => w.groupId === group.id)).find(Boolean)
+      ?? parentWorkspaces[0];
     const sorted = [...sessions].sort((a, b) => {
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
       return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
@@ -115,6 +126,7 @@ export function useChatSidebar({
       const children = childrenByParent.get(w.id);
       return {
         id: w.id,
+        pinned: w.pinned,
         path: w.path,
         // Worktree 子行的主名是分支名（mockup 场景 1），目录名进 tooltip。
         label: alias || (meta?.branch ?? w.name),
@@ -155,8 +167,8 @@ export function useChatSidebar({
         ],
       };
     };
-    return parentWorkspaces.map((w, index) => buildRepo(w, index === 0));
-  }, [parentWorkspaces, childrenByParent, workspaceAliases, sessions, openTabs, threadLimit, threadStreaming, threadRetrying, unseen, i18n.language, uiHooks, t]);
+    return parentWorkspaces.map((w) => buildRepo(w, w.id === firstWorkspace?.id));
+  }, [parentWorkspaces, childrenByParent, workspaceGroups, workspaceAliases, sessions, openTabs, threadLimit, threadStreaming, threadRetrying, unseen, i18n.language, uiHooks, t]);
   // 工作区二级分类: bucket repos by their workspace's group assignment.
   // Ungrouped repos come first (no header), then groups in settings order.
   // Empty groups stay in the tree — the sidebar renders them like populated
@@ -180,9 +192,10 @@ export function useChatSidebar({
       }
     });
     const result: AiChatRepoSection[] = [];
-    if (ungrouped.length > 0) result.push({ id: null, name: "", repos: ungrouped });
+    const pinnedFirst = (items: AiChatRepo[]) => [...items.filter((r) => r.pinned), ...items.filter((r) => !r.pinned)];
+    if (ungrouped.length > 0) result.push({ id: null, name: "", repos: pinnedFirst(ungrouped) });
     groups.forEach((group) => {
-      result.push({ id: group.id, name: group.name, repos: byGroup.get(group.id) ?? [] });
+      result.push({ id: group.id, name: group.name, repos: pinnedFirst(byGroup.get(group.id) ?? []) });
     });
     return result.some((s) => s.id !== null) ? result : undefined;
   }, [repos, parentWorkspaces, workspaceGroups]);
@@ -251,6 +264,25 @@ export function useChatSidebar({
           void pinSession(session.engine, session.sessionId, !session.pinned);
         } else if (action === "rename") {
           setDialog({ kind: "rename", session });
+        } else if (action === "edit") {
+          if (session.engine === "agy") return;
+          const key = sessionKey(session.engine, session.sessionId, session.workspacePath);
+          const state = useChatStore.getState();
+          if (state.streamingByKey[key] || state.bySession[key]?.streaming) {
+            useChatStore.setState({ actionError: t("chat.sessionEditRunning") });
+            return;
+          }
+          void useFilesStore.getState().openSessionFile(session);
+        } else if (action === "refresh") {
+          const key = sessionKey(session.engine, session.sessionId, session.workspacePath);
+          const state = useChatStore.getState();
+          if (state.streamingByKey[key] || state.bySession[key]?.streaming) {
+            useChatStore.setState({ actionError: t("chat.sessionRefreshRunning") });
+            return;
+          }
+          dismissCenterSurfaces();
+          void reloadSession(session);
+          void selectSession(session.engine, session.sessionId, session.workspacePath);
         } else if (action === "archive") {
           void archiveSession(session);
         } else if (action === "delete") {
@@ -263,7 +295,7 @@ export function useChatSidebar({
         closeTab(draft.engine, null, draft.workspacePath);
       }
     },
-    [sessionById, pinSession, archiveSession, setDialog, closeTab],
+    [sessionById, pinSession, archiveSession, reloadSession, selectSession, setDialog, closeTab, t],
   );
   // 右键菜单「复制 ID」:写入原生会话 uuid(CLI --resume 可用的那个),与
   // 文件树「复制路径」一致——静默写剪贴板,失败不打扰。
@@ -301,6 +333,12 @@ export function useChatSidebar({
       void setWorkspaceArchived(workspaceId, archived);
     },
     [workspaces, setWorkspaceArchived, setDialog],
+  );
+  const handleSetWorkspacePinned = useCallback(
+    (workspaceId: string, pinned: boolean) => {
+      void setWorkspacePinned(workspaceId, pinned);
+    },
+    [setWorkspacePinned],
   );
   // 右键菜单/WORKTREES 分组 ＋：打开创建对话框（目标是该工作区所在仓库——
   // worktree 行上触发时落到它的父工作区）。
@@ -426,6 +464,7 @@ export function useChatSidebar({
     handleRemoveWorkspace,
     handleWorkspaceAlias,
     handleSetWorkspaceArchived,
+    handleSetWorkspacePinned,
     handleNewSession,
     handleNewSessionInWorkspace,
     handleNewBrowser,

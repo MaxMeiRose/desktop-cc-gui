@@ -37,12 +37,14 @@ pub mod opencode_server;
 mod opencode_session;
 pub mod pi_family;
 pub mod pi_family_auth;
+mod pi_family_env;
 pub mod plan_review;
 pub mod qoder;
 mod qoder_session;
 mod reader;
 mod registry;
 pub mod resolve;
+mod shell_env;
 pub mod wsl_transport;
 
 pub(crate) use resolve::command_for_binary;
@@ -217,6 +219,17 @@ pub trait Engine: Send + Sync {
     }
     /// Parse one NDJSON stdout line into zero or more events.
     fn parse_line(&self, line: &str, out: &mut Vec<EngineEvent>);
+    /// Attach this run's served-model sidecar before the reader starts.
+    /// Engines whose injected extension records the provider's own `model`
+    /// read it back; the default is a no-op.
+    fn set_served_models_file(&self, _path: &std::path::Path) {}
+    /// True when this run's stream can report what served it (`Served`).
+    /// The response check keeps its badge while that report is pending;
+    /// a run that can never report shows nothing until evidence arrives,
+    /// instead of an "unreported" badge on every turn.
+    fn reports_served(&self) -> bool {
+        false
+    }
     /// True when the engine drives its own transport (e.g. a host WS session)
     /// instead of spawning a child process. send_message routes these to a
     /// virtual run: no spawn, no pid — the registry entry carries only the
@@ -953,6 +966,7 @@ async fn send_message_inner_with_sink(
     let reader_abort = Arc::new(std::sync::OnceLock::new());
     {
         let mut map = state.processes.0.lock().map_err(|e| e.to_string())?;
+        state.processes.ensure_session_not_editing(session_id.as_deref())?;
         if map.contains_key(&run_id) {
             return Err("run id already active".into());
         }
@@ -961,19 +975,20 @@ async fn send_message_inner_with_sink(
                 "too many concurrent runs ({MAX_CONCURRENT_RUNS}); wait for one to finish"
             ));
         }
-        map.insert(
-            run_id.clone(),
-            ChildEntry {
-                child: None,
-                pid: 0,
-                run_id: run_id.clone(),
-                killed: Arc::clone(&killed),
-                reader_abort: Arc::clone(&reader_abort),
-                stdin: None,
-                questions: Arc::new(Mutex::new(HashMap::new())),
-                plans: Arc::new(Mutex::new(HashMap::new())),
-            },
-        );
+        let entry = ChildEntry {
+            child: None,
+            pid: 0,
+            run_id: run_id.clone(),
+            killed: Arc::clone(&killed),
+            reader_abort: Arc::clone(&reader_abort),
+            stdin: None,
+            questions: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
+        };
+        if let Some(session_id) = session_id.as_ref() {
+            map.entry(session_id.clone()).or_insert_with(|| entry.clone());
+        }
+        map.insert(run_id.clone(), entry);
     }
     let reserved = run_id.clone();
     let result = send_reserved(
@@ -1086,6 +1101,25 @@ async fn send_reserved(
         allowed_tools,
         wsl_tp.is_some(),
     )?;
+    if wsl_tp.is_none() && matches!(engine.as_str(), "pi" | "omp") {
+        // 只向登录 shell 查询当前引擎配置中的变量：PI 用 $VAR，OMP 用裸名字。
+        // 只注入这次子进程；WSL 不带本机 env，跳过。
+        pi_family_env::apply(&mut launch.built.command, &engine).await;
+    }
+    // pi/omp: the injected extension observes the provider response's own
+    // `model` field and appends it to a per-run sidecar. The reader consults
+    // that file when `message_end` has no `upstreamModel`. Remote workspaces
+    // run the CLI inside WSL, which cannot write this host-side path; runs
+    // without the extension have nothing to write it.
+    if wsl_tp.is_none() && pi_family::loads_served_model_bridge(&engine, &launch.req) {
+        if let Some(path) = pi_family::prepare_served_models_file(&run_id) {
+            launch.engine_impl.set_served_models_file(&path);
+            launch
+                .built
+                .command
+                .env("CCGUI_SERVED_MODEL_FILE", path.as_os_str());
+        }
+    }
     // Host-stream engines drive their own transport: no child process — the
     // registry entry only routes interrupts to the transport task. Their
     // drivers spawn locally, so a remote workspace either keeps the CLI

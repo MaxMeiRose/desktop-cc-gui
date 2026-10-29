@@ -173,11 +173,33 @@ pub struct AppSettings {
     /// until the user folds it (设置 → 通用 → 行为 → 思考过程).
     #[serde(default)]
     pub thinking_auto_collapse: Option<bool>,
+    /// Notifications master switch (设置 → 通用 → 行为 → 系统通知): None/Some(true) = enabled (default).
+    #[serde(default)]
+    pub notifications_enabled: Option<bool>,
+    /// Notify on conversation turn complete: None/Some(true) = enabled (default).
+    #[serde(default)]
+    pub notify_on_completion: Option<bool>,
+    /// Notify on interactive questions/permission/plan review: None/Some(true) = enabled (default).
+    #[serde(default)]
+    pub notify_on_question: Option<bool>,
+    /// Notify when conversation is interrupted: None/Some(true) = enabled (default).
+    #[serde(default)]
+    pub notify_on_interrupted: Option<bool>,
+    /// Notify when conversation encounters an error: None/Some(true) = enabled (default).
+    #[serde(default)]
+    pub notify_on_error: Option<bool>,
+    /// Only notify when the window/session is in background: None/Some(true) = enabled (default).
+    #[serde(default)]
+    pub notify_when_unfocused_only: Option<bool>,
     /// Chat content column width (设置 → 通用 → 外观 → 宽幕布): None/Some(false)
     /// = the default centered column, Some(true) = the timeline, composer and
     /// docks fill their pane (only the 16px gutter stays).
     #[serde(default)]
     pub chat_wide_layout: Option<bool>,
+    /// File tree entries Git ignores (设置 → 通用 → 行为): None/Some(false) =
+    /// listed, drawn faded; Some(true) = hidden from the tree.
+    #[serde(default)]
+    pub file_tree_hide_ignored: Option<bool>,
     /// Beta entry points (设置 → 其他 → 内测功能): feature id -> enabled.
     /// Empty/missing = the entry stays hidden; every id is off by default.
     #[serde(default)]
@@ -411,7 +433,14 @@ impl Default for AppSettings {
             decrease_ui_scale_shortcut: default_decrease_ui_scale_shortcut(),
             reset_ui_scale_shortcut: default_reset_ui_scale_shortcut(),
             thinking_auto_collapse: None,
+            notifications_enabled: None,
+            notify_on_completion: None,
+            notify_on_question: None,
+            notify_on_interrupted: None,
+            notify_on_error: None,
+            notify_when_unfocused_only: None,
             chat_wide_layout: None,
+            file_tree_hide_ignored: None,
             beta_features: HashMap::new(),
             terminal_shell_path: None,
             dsh_host: None,
@@ -1260,6 +1289,24 @@ mod tests {
         let narrow: AppSettings = serde_json::from_str(r#"{"chatWideLayout":false}"#).unwrap();
         assert_eq!(narrow.chat_wide_layout, Some(false));
     }
+    /// 文件树隐藏 Git 忽略项（设置 → 通用 → 行为）：缺字段 / false 都是照常列出
+    /// （浅色显示），true 才隐藏；camelCase 键名要能往返。
+    #[test]
+    fn file_tree_hide_ignored_defaults_to_shown_and_round_trips() {
+        assert_eq!(AppSettings::default().file_tree_hide_ignored, None);
+        let parsed: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            parsed.file_tree_hide_ignored, None,
+            "旧设置文件没有 fileTreeHideIgnored → 照常显示忽略项，不能崩"
+        );
+        let hide: AppSettings =
+            serde_json::from_str(r#"{"fileTreeHideIgnored":true}"#).unwrap();
+        assert_eq!(hide.file_tree_hide_ignored, Some(true));
+        assert!(serde_json::to_string(&hide)
+            .unwrap()
+            .contains("\"fileTreeHideIgnored\":true"));
+    }
+
     #[test]
     fn font_fields_default_to_bundled_and_round_trip_camel_case() {
         let parsed: AppSettings = serde_json::from_str("{}").unwrap();

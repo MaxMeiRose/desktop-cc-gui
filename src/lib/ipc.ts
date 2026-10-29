@@ -3,6 +3,34 @@ import { invoke, listen } from "./transport";
 import type { NativePerformanceDiagnostics } from "./performance-types";
 import { withGrantRetry } from "./grant";
 
+// Async Tauri commands can start out of call order. Preserve the caller's
+// order only where an older write would otherwise overwrite a newer choice.
+// Other resources and read commands remain independent.
+const persistenceTails = new Map<string, Promise<unknown>>();
+
+function invokePersisted<T>(
+  key: string,
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  const previous = persistenceTails.get(key) ?? Promise.resolve();
+  const result = previous.then(
+    () => invoke<T>(command, args),
+    () => invoke<T>(command, args),
+  );
+  // A failed request rejects its own caller, not every later write. Remove
+  // the tail once idle so session/plugin keys do not accumulate indefinitely.
+  const settled = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  persistenceTails.set(key, settled);
+  void settled.then(() => {
+    if (persistenceTails.get(key) === settled) persistenceTails.delete(key);
+  });
+  return result;
+}
+
 // ==================== Shared types (mirror Rust serde camelCase) ====================
 
 export interface SessionMeta {
@@ -46,10 +74,15 @@ export interface TodoItem {
   detail?: string | null;
 }
 
+/** One entry of a todo payload. A patch entry may leave `status` out: the
+ *  update did not set one (a TaskUpdate that only renames), so the item
+ *  keeps its current status. */
+export type TodoPayloadItem = Omit<TodoItem, "status"> & { status?: TodoStatus };
+
 /** Todo-list payload on todo-class tool rows: replace = full snapshot,
- * otherwise a patch matched by content (status "dropped" removes). */
+ * otherwise a patch matched by id, then content (status "dropped" removes). */
 export interface TodosPayload {
-  items: TodoItem[];
+  items: TodoPayloadItem[];
   replace: boolean;
 }
 
@@ -72,6 +105,11 @@ export interface Message {
   args?: unknown;
   /** Tool execution result/output; shown in the tool panel. */
   result?: unknown;
+  /** The engine's id for this tool call, when it reported one. Runtime-only:
+   *  a live result patch pairs to its call on this, so parallel calls of one
+   *  tool (four `TaskCreate` in a batch) each settle their own row. History
+   *  rows do not carry it — the backend pairs results by id while folding. */
+  toolCallId?: string;
   todos?: TodosPayload;
   ts: string | null;
   usage?: unknown;
@@ -88,6 +126,7 @@ export interface Message {
       comparisonModel?: string | null;
     };
     served: { model: string | null; effort: string | null };
+    reportsServed?: boolean;
   } | null;
   /** Turn duration in milliseconds (measured from prompt send to turn completion) */
   durationMs?: number | null;
@@ -95,11 +134,14 @@ export interface Message {
   live?: boolean;
   /** Permission-denial card state (role "grant"): the CLI denied a tool call
    * targeting `path`; pending until the user answers the card. `dir` is the
-   * directory a grant would cover (grant_scope preview). Grant rows are
-   * ephemeral UI — they are not part of the CLI's session history. */
+   * directory a grant would cover (grant_scope preview). `toolUseId` is the
+   * denied call, which matches a denial's mid-turn and result-line copies.
+   * Grant rows are ephemeral UI — they are not part of the CLI's session
+   * history. */
   grant?: {
     status: "pending" | "granted" | "declined";
     dir?: string | null;
+    toolUseId?: string | null;
   };
   /** AskUserQuestion card state (role "question"): the CLI parked the ask on
    * the control protocol; `pending` until the user picks or skips. `runId`
@@ -124,12 +166,21 @@ export interface SessionPage {
   subagentHistory: Message[];
 }
 
+/** Complete native source, or an editable native-record view for database CLIs. */
+export interface SessionFileDocument {
+  path: string;
+  name: string;
+  text: string;
+  version: string;
+}
+
 export interface Workspace {
   id: string;
   path: string;
   name: string;
   lastOpenedAt: number | null;
   sortOrder: number | null;
+  pinned?: boolean;
   /** Sidebar group id (工作区分组); null = ungrouped. */
   groupId: string | null;
   /** "worktree" = git worktree child under its parent workspace row;
@@ -198,6 +249,7 @@ export type WorktreeCreateStage =
 
 export type WorktreeErrorKind =
   | "not_a_repo"
+  | "repo_open_failed"
   | "invalid_branch"
   | "branch_not_found"
   | "branch_exists"
@@ -513,9 +565,24 @@ export interface AppSettings {
   /** Thinking-process row behavior once its thinking settles: true/absent =
    *  auto-fold (default), false = stay expanded until the user folds it. */
   thinkingAutoCollapse?: boolean | null;
+  /** System notifications master switch (设置 → 通用 → 行为 → 系统通知): true/absent = enabled (default). */
+  notificationsEnabled?: boolean | null;
+  /** Notify when conversation turn completes: true/absent = enabled (default). */
+  notifyOnCompletion?: boolean | null;
+  /** Notify on interactive questions/permission/plan review: true/absent = enabled (default). */
+  notifyOnQuestion?: boolean | null;
+  /** Notify when conversation turn is interrupted: true/absent = enabled (default). */
+  notifyOnInterrupted?: boolean | null;
+  /** Notify when conversation encounters an error: true/absent = enabled (default). */
+  notifyOnError?: boolean | null;
+  /** Only notify when app window/session is unfocused/background: true/absent = true (default). */
+  notifyWhenUnfocusedOnly?: boolean | null;
   /** 宽幕布 (设置 → 通用 → 外观): true = the chat content column fills its
    *  pane instead of the default centered column (750px / `max-w-3xl`). */
   chatWideLayout?: boolean | null;
+  /** File tree entries Git ignores (设置 → 通用 → 行为): absent/false = listed
+   *  and drawn faded, true = hidden from the tree. */
+  fileTreeHideIgnored?: boolean | null;
   /** Beta entry points (设置 → 其他 → 内测功能): feature id -> enabled.
    *  Missing/false = the entry stays hidden (default off). */
   betaFeatures?: Record<string, boolean> | null;
@@ -564,6 +631,10 @@ export interface DirEntry {
   isDir: boolean;
   size: number;
   mtimeMs: number;
+  /** Git ignores this entry (`.gitignore` / info/exclude / global excludes,
+   *  and `.git` itself; tracked content never is). Only set when `listDir`
+   *  was asked with `gitIgnoreRoot`; absent = not ignored / not asked. */
+  ignored?: boolean;
 }
 
 export interface FileContent {
@@ -580,6 +651,20 @@ export interface FileContent {
 export interface FileOpResult {
   path: string;
   isDir: boolean;
+}
+
+/** Result of `paste_clipboard_items`: what the OS clipboard's file list
+ *  produced, plus the reason each rejected item stayed behind. */
+export interface PasteClipboardResult {
+  created: FileOpResult[];
+  failed: string[];
+}
+
+/** Host-read OS file clipboard, including its native generation counter.
+ *  The counter is null where no native file clipboard bridge exists. */
+export interface ClipboardFileSnapshot {
+  paths: string[];
+  changeCount: number | null;
 }
 
 export interface SearchHit {
@@ -1048,36 +1133,6 @@ export interface WebAccessInfo {
   availableIps?: LanIpEntry[];
 }
 
-/** One finished turn as it enters the usage ledger. */
-export interface UsageEntryInput {
-  /** Epoch ms when the turn settled. */
-  ts: number;
-  engine: string;
-  model: string | null;
-  sessionId: string | null;
-  workspacePath: string | null;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  durationMs: number | null;
-  /** Model responses this turn reported (>= 1). */
-  reports: number;
-}
-
-/** Ledger totals for one (local day, engine, model) bucket. */
-export interface UsageRow {
-  /** Local "YYYY-MM-DD". */
-  day: string;
-  engine: string;
-  model: string;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  /** Model responses in this bucket — the request total. */
-  requests: number;
-}
 // ---- DeepSeek Harness local host ----
 
 /** Snapshot of the DSH local host + CLI probe (`dsh_host_status`,
@@ -1536,10 +1591,19 @@ export const ipc = {
    * new paths (same order). Picked paths live outside the sandbox, so the
    * engines' path-based image pipeline cannot read them in place. */
   importAttachments: (paths: string[]) => invoke<string[]>("import_attachments", { paths }),
-  /** Absolute paths of the files on the OS clipboard (Finder / Explorer
-   * copies expose no path to the webview). Empty when the clipboard holds no
-   * file; the web bridge has no OS pasteboard and always answers empty. */
-  clipboardFilePaths: () => invoke<string[]>("clipboard_file_paths"),
+  /** Host-read OS clipboard snapshot (Finder / Explorer file copies expose
+   *  no path to the webview). Rejects on a real read failure; the web bridge
+   *  has no OS pasteboard and returns an empty snapshot with no generation. */
+  clipboardFileSnapshot: () => invoke<ClipboardFileSnapshot>("clipboard_file_snapshot"),
+  /** The OS clipboard generation alone. Unlike a snapshot it never opens the
+   *  clipboard, so it answers while another program holds it; null where no
+   *  native generation exists (Linux, the web bridge). */
+  clipboardChangeCount: () => invoke<number | null>("clipboard_change_count"),
+  /** Replace the OS clipboard with a file list, so Finder / Explorer paste
+   *  the actual items. Rejects when the host cannot write; the in-app tree
+   *  clipboard still carries the item (Linux has no native bridge). */
+  setClipboardFilePaths: (paths: string[]) =>
+    invoke<void>("clipboard_set_file_paths", { paths }),
   listEngineModels: (engine: string, workspace?: string) =>
     withGrantRetry(() =>
       invoke<EngineCatalog>("list_engine_models", { engine, workspace: workspace ?? null }),
@@ -1551,12 +1615,19 @@ export const ipc = {
     invoke<void>("archive_session", { session }),
   restoreSession: (engine: string, sessionId: string) =>
     invoke<void>("restore_session", { engine, sessionId }),
+  readSessionFile: (engine: string, sessionId: string, workspacePath?: string, remotePath?: string) =>
+    invoke<SessionFileDocument>("read_session_file", { engine, sessionId, workspacePath, remotePath }),
+  writeSessionFile: (engine: string, sessionId: string, content: string, expectedVersion: string, workspacePath?: string, remotePath?: string) =>
+    invoke<SessionFileDocument>("write_session_file", { engine, sessionId, content, expectedVersion, workspacePath, remotePath }),
+  openSessionFileInDefaultEditor: (engine: string, sessionId: string) =>
+    invoke<void>("open_session_file_in_default_editor", { engine, sessionId }),
   loadSessionPage: (
     engine: string,
     sessionId: string,
     limit?: number,
     beforeSeq?: number | null,
-  ) => invoke<SessionPage>("load_session_page", { engine, sessionId, limit, beforeSeq }),
+    forceReload?: boolean,
+  ) => invoke<SessionPage>("load_session_page", { engine, sessionId, limit, beforeSeq, forceReload }),
   /** Full-text search over message bodies (⌘L palette). FTS5 trigram when
    *  every token is ≥3 chars, exact AND-substring LIKE otherwise. */
   searchMessages: (
@@ -1574,6 +1645,7 @@ export const ipc = {
     remotePath: string,
     limit?: number,
     beforeSeq?: number | null,
+    forceReload?: boolean,
   ) =>
     invoke<SessionPage>("load_remote_session_page", {
       workspacePath,
@@ -1582,6 +1654,7 @@ export const ipc = {
       remotePath,
       limit,
       beforeSeq,
+      forceReload,
     }),
   deleteSession: (engine: string, sessionId: string) =>
     invoke<void>("delete_session", { engine, sessionId }),
@@ -1609,7 +1682,11 @@ export const ipc = {
   /** Remember the reasoning level a session ran, so reopening it — here, in
    *  another window, or on the phone — keeps that level. */
   rememberSessionEffort: (engine: string, sessionId: string, effort: string) =>
-    invoke<void>("remember_session_effort", { engine, sessionId, effort }),
+    invokePersisted<void>(`session-effort:${engine}\0${sessionId}`, "remember_session_effort", {
+      engine,
+      sessionId,
+      effort,
+    }),
   /** Remember the in-app channel a session ran, so reopening it keeps that
    *  channel without rewriting the CLI's own config file. */
   rememberSessionProvider: (engine: string, sessionId: string, providerId: string) =>
@@ -1634,6 +1711,7 @@ export const ipc = {
   pluginAddWorkspace: (pluginId: string, path: string, meta?: Record<string, unknown>) =>
     invoke<Workspace>("plugin_add_workspace", { pluginId, path, meta: meta ?? null }),
   reorderWorkspaces: (ids: string[]) => invoke<void>("reorder_workspaces", { ids }),
+  setWorkspacePinned: (id: string, pinned: boolean) => invoke<void>("set_workspace_pinned", { id, pinned }),
   removeWorkspace: (id: string) => invoke<void>("remove_workspace", { id }),
   setWorkspaceGroup: (id: string, groupId: string | null) =>
     invoke<void>("set_workspace_group", { id, groupId }),
@@ -1650,7 +1728,12 @@ export const ipc = {
   terminalClose: (id: string) => invoke<void>("terminal_close", { id }),
   // files — every command goes through withGrantRetry so an outside-roots
   // rejection becomes a one-click grant prompt + retry (see lib/grant.ts).
-  listDir: (path: string) => withGrantRetry(() => invoke<DirEntry[]>("list_dir", { path })),
+  /** `gitIgnoreRoot` (the file tree's root) opts into per-entry `ignored`
+   *  flags; callers that only need names leave it out and skip the Git work. */
+  listDir: (path: string, opts?: { gitIgnoreRoot?: string }) =>
+    withGrantRetry(() =>
+      invoke<DirEntry[]>("list_dir", { path, gitIgnoreRoot: opts?.gitIgnoreRoot }),
+    ),
   readFile: (path: string) => withGrantRetry(() => invoke<FileContent>("read_file", { path })),
   writeFile: (path: string, content: string) =>
     withGrantRetry(() => invoke<void>("write_file", { path, content })),
@@ -1664,6 +1747,13 @@ export const ipc = {
     withGrantRetry(() => invoke<FileOpResult>("duplicate_item", { path })),
   pasteItem: (source: string, targetDir: string) =>
     withGrantRetry(() => invoke<FileOpResult>("paste_item", { source, targetDir })),
+  /** Copy whatever file list the OS clipboard holds into `targetDir`. The
+   *  host reads the clipboard itself — source paths never come over IPC —
+   *  and the web bridge answers with an empty list. */
+  pasteClipboardItems: (targetDir: string) =>
+    withGrantRetry(() =>
+      invoke<PasteClipboardResult>("paste_clipboard_items", { targetDir }),
+    ),
   searchText: (path: string, query: string) =>
     withGrantRetry(() => invoke<SearchHit[]>("search_text", { path, query })),
   /** Whole-tree file index for the composer @-mention picker (relative
@@ -1818,6 +1908,7 @@ export const ipc = {
     invoke<void>("git_checkout", { path, branch }),
   gitCreateBranch: (path: string, name: string) =>
     invoke<void>("git_create_branch", { path, name }),
+  gitInit: (path: string) => invoke<void>("git_init", { path }),
   // git worktree (子工作区)
   gitWorktreeList: (repoPath: string) =>
     invoke<WorktreeInfo[]>("git_worktree_list", { repoPath }),
@@ -1891,6 +1982,9 @@ export const ipc = {
     invoke<string | null>("get_program_icon", { executablePath }),
   revealInFileManager: (path: string) =>
     invoke<void>("reveal_in_file_manager", { path }),
+  /** Local .html/.htm/.xhtml in the default web browser (desktop only: the
+   *  remote web bridge would open it on the host, not for the remote user). */
+  openInBrowser: (path: string) => invoke<void>("open_in_browser", { path }),
   // metrics
   appMetrics: () => invoke<AppMetrics>("app_metrics"),
   performanceDiagnostics: () => invoke<NativePerformanceDiagnostics>("performance_diagnostics"),
@@ -1916,9 +2010,9 @@ export const ipc = {
   pluginStorageGet: (id: string, key: string) =>
     invoke<unknown>("plugin_storage_get", { id, key }),
   pluginStorageSet: (id: string, key: string, value: unknown) =>
-    invoke<void>("plugin_storage_set", { id, key, value }),
+    invokePersisted<void>(`plugin-storage:${id}\0${key}`, "plugin_storage_set", { id, key, value }),
   pluginStorageDelete: (id: string, key: string) =>
-    invoke<void>("plugin_storage_delete", { id, key }),
+    invokePersisted<void>(`plugin-storage:${id}\0${key}`, "plugin_storage_delete", { id, key }),
   pluginWorkspaceMetadata: (pluginId: string, workspacePath: string) =>
     invoke<PluginWorkspaceMetadata>("workspace_metadata", { pluginId, workspacePath }),
   pluginDocumentStorageGetLocation: (pluginId: string) =>
@@ -2019,11 +2113,6 @@ export const ipc = {
   webAccessStatus: () => invoke<WebAccessInfo | null>("web_access_status"),
   webAccessAvailableIps: () => invoke<LanIpEntry[]>("web_access_available_ips"),
   webAccessRotateToken: () => invoke<string>("web_access_rotate_token"),
-  // usage ledger (settings 用量)
-  usageRecord: (entry: UsageEntryInput) => invoke<void>("usage_record", { entry }),
-  usageSummary: (days: number, tzOffsetMinutes: number) =>
-    invoke<UsageRow[]>("usage_summary", { days, tzOffsetMinutes }),
-  usageClear: () => invoke<void>("usage_clear"),
   // DeepSeek Harness local host (dsh web --host H --port P)
   dshHostStatus: () => invoke<DshHostStatus>("dsh_host_status"),
   dshHostStart: () => invoke<DshHostStatus>("dsh_host_start"),

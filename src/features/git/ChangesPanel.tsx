@@ -17,8 +17,15 @@ import { useGitStore } from "./store";
 import { ChangesPanelHeader } from "./ChangesPanelHeader";
 import { CommitFooter } from "./CommitFooter";
 import { buildGitTree, flattenGitTree } from "./git-tree";
+import {
+  ChangesFileContextMenu,
+  useChangesFileMenu,
+  type ChangesFileMenuOpener,
+} from "./ChangesFileContextMenu";
 import { DirectoryRow, FileRow } from "./GitTreeRow";
+import { NotRepoState } from "./NotRepoState";
 import { RepoSection } from "./RepoSection";
+import { StatusErrorState } from "./StatusErrorState";
 
 function useVisibleGitValue<Value>(
   visible: boolean,
@@ -171,12 +178,14 @@ function useChangesActions(
       });
   }, []);
 
-  /** Dismiss the header error: the failed action's error, else the store's
-   *  last refresh failure. */
+  /** Dismiss the header error. A failed refresh clears the status, so its
+   *  reason lives in the body (StatusErrorState) until a re-read succeeds;
+   *  the store error is cleared here only when the header shows it, i.e.
+   *  next to a status. */
   const dismissError = useCallback(() => {
     setActionError(null);
-    useGitStore.getState().clearError(gitWorkspacePath);
-  }, [gitWorkspacePath]);
+    if (status) useGitStore.getState().clearError(gitWorkspacePath);
+  }, [gitWorkspacePath, status]);
 
   const stage = useCallback(
     (files: string[]) => {
@@ -421,7 +430,6 @@ function RepoChangesPanel({
   sharedScrollElement?: HTMLDivElement | null;
   discoveryRevision?: number;
 }) {
-  const { t } = useTranslation();
   const selectedPath = useFilesStore((s) => s.selectedPath);
   const repositories = useFilesStore((s) => s.repositories);
   const gitWorkspacePath = useMemo(
@@ -437,6 +445,9 @@ function RepoChangesPanel({
   const status = useVisibleGitValue(visible, (s) => s.statusByWorkspace[gitWorkspacePath]);
   const notRepo = useVisibleGitValue(visible, (s) => s.notRepoByWorkspace[gitWorkspacePath]);
   const refreshError = useVisibleGitValue(visible, (s) => s.errorByWorkspace[gitWorkspacePath]);
+  // A failed refresh clears the status, so its reason is the whole body
+  // rather than a header line over an endless "loading".
+  const statusError = status ? null : (refreshError ?? null);
   const branches = useVisibleGitValue(visible, (s) => s.branchesByWorkspace[gitWorkspacePath]);
   const [ownScrollElement, setOwnScrollElement] = useState<HTMLDivElement | null>(null);
   const scrollElement = embedded ? (sharedScrollElement ?? null) : ownScrollElement;
@@ -472,6 +483,7 @@ function RepoChangesPanel({
     openStagedDiff,
     openUnstagedDiff,
   } = useChangesActions(gitWorkspacePath, status, selection);
+  const fileMenu = useChangesFileMenu(gitWorkspacePath, visible);
 
   useLayoutEffect(() => {
     if (!embedded && visible && scrollElement) {
@@ -502,11 +514,24 @@ function RepoChangesPanel({
       behind={status?.behind}
       branches={branches}
       pending={pending}
-      error={actionError ?? refreshError ?? null}
+      error={actionError ?? (statusError ? null : refreshError) ?? null}
       run={run}
       onDismissError={dismissError}
       viewMode={viewMode}
       onToggleViewMode={toggleViewMode}
+    />
+  ) : null;
+
+  // Only the list and the commit box give way to a status-read failure;
+  // open confirmations and the row menu stay put instead of vanishing and
+  // resurfacing with stale paths once the status is back.
+  const statusErrorState = statusError ? (
+    <StatusErrorState
+      message={statusError}
+      busy={pending.retryStatus === true}
+      onRetry={() =>
+        run("retryStatus", () => useGitStore.getState().refresh(gitWorkspacePath, true))
+      }
     />
   ) : null;
 
@@ -517,11 +542,10 @@ function RepoChangesPanel({
         className={cx("flex h-full flex-col bg-background-primary-default", className)}
       >
         {header}
-        <div className="flex flex-1 items-center justify-center p-4">
-          <p className="text-center text-body-medium text-text-tertiary">
-            {t("git.notARepo")}
-          </p>
-        </div>
+        <NotRepoState
+          busy={pending.init === true}
+          onInit={() => run("init", () => useGitStore.getState().init(gitWorkspacePath))}
+        />
       </aside>
     );
   }
@@ -530,38 +554,43 @@ function RepoChangesPanel({
     return (
       <>
         {header}
-        <ChangesBody
-          status={status}
-          visible={visible}
-          scrollElement={scrollElement}
-          scrollOffset={scrollOffset}
-          pending={pending}
-          viewMode={viewMode}
-          selectedFiles={selectedFiles}
-          onToggleSelectFile={toggleSelectFile}
-          onToggleSelectDir={toggleSelectDir}
-          onToggleSelectGroup={toggleSelectGroup}
-          stage={stage}
-          unstage={unstage}
-          stageOne={stageOne}
-          unstageOne={unstageOne}
-          discardRow={discardRow}
-          setDiscardTarget={setDiscardTarget}
-          openStagedDiff={openStagedDiff}
-          openUnstagedDiff={openUnstagedDiff}
-        />
-        {visible && (
-          <CommitFooter
-            workspacePath={gitWorkspacePath}
-            stagedCount={status?.staged.length ?? 0}
-            selectedCount={selectedFiles.size}
-            selectedFiles={selectedFiles}
-            onCommitSelected={handleCommitSelected}
-            busy={pending.commit === true}
-            commitMsg={commitMsg}
-            onCommitMsgChange={setCommitMsg}
-            run={run}
-          />
+        {statusErrorState ?? (
+          <>
+            <ChangesBody
+              status={status}
+              visible={visible}
+              scrollElement={scrollElement}
+              scrollOffset={scrollOffset}
+              pending={pending}
+              viewMode={viewMode}
+              selectedFiles={selectedFiles}
+              onToggleSelectFile={toggleSelectFile}
+              onToggleSelectDir={toggleSelectDir}
+              onToggleSelectGroup={toggleSelectGroup}
+              stage={stage}
+              unstage={unstage}
+              stageOne={stageOne}
+              unstageOne={unstageOne}
+              discardRow={discardRow}
+              setDiscardTarget={setDiscardTarget}
+              openStagedDiff={openStagedDiff}
+              openUnstagedDiff={openUnstagedDiff}
+              onRowContextMenu={fileMenu.openMenu}
+            />
+            {visible && (
+              <CommitFooter
+                workspacePath={gitWorkspacePath}
+                stagedCount={status?.staged.length ?? 0}
+                selectedCount={selectedFiles.size}
+                selectedFiles={selectedFiles}
+                onCommitSelected={handleCommitSelected}
+                busy={pending.commit === true}
+                commitMsg={commitMsg}
+                onCommitMsgChange={setCommitMsg}
+                run={run}
+              />
+            )}
+          </>
         )}
         <ChangesConfirmDialogs
           visible={visible}
@@ -572,6 +601,9 @@ function RepoChangesPanel({
           onConfirmPlan={confirmCommitPlan}
           onCancelPlan={() => setPendingCommitPlan(null)}
         />
+        {visible && fileMenu.menu && (
+          <ChangesFileContextMenu menu={fileMenu.menu} run={run} onClose={fileMenu.closeMenu} />
+        )}
       </>
     );
   }
@@ -582,46 +614,51 @@ function RepoChangesPanel({
       className={cx("flex h-full min-h-0 flex-col bg-background-primary-default", className)}
     >
       {header}
-      <div
-        ref={setOwnScrollElement}
-        className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
-        onScroll={(event) => {
-          if (visible) scrollOffset.current = event.currentTarget.scrollTop;
-        }}
-      >
-        <ChangesBody
-          status={status}
-          visible={visible}
-          scrollElement={scrollElement}
-          scrollOffset={scrollOffset}
-          pending={pending}
-          viewMode={viewMode}
-          selectedFiles={selectedFiles}
-          onToggleSelectFile={toggleSelectFile}
-          onToggleSelectDir={toggleSelectDir}
-          onToggleSelectGroup={toggleSelectGroup}
-          stage={stage}
-          unstage={unstage}
-          stageOne={stageOne}
-          unstageOne={unstageOne}
-          discardRow={discardRow}
-          setDiscardTarget={setDiscardTarget}
-          openStagedDiff={openStagedDiff}
-          openUnstagedDiff={openUnstagedDiff}
-        />
-      </div>
-      {visible && (
-        <CommitFooter
-          workspacePath={gitWorkspacePath}
-          stagedCount={status?.staged.length ?? 0}
-          selectedCount={selectedFiles.size}
-          selectedFiles={selectedFiles}
-          onCommitSelected={handleCommitSelected}
-          busy={pending.commit === true}
-          commitMsg={commitMsg}
-          onCommitMsgChange={setCommitMsg}
-          run={run}
-        />
+      {statusErrorState ?? (
+        <>
+          <div
+            ref={setOwnScrollElement}
+            className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
+            onScroll={(event) => {
+              if (visible) scrollOffset.current = event.currentTarget.scrollTop;
+            }}
+          >
+            <ChangesBody
+              status={status}
+              visible={visible}
+              scrollElement={scrollElement}
+              scrollOffset={scrollOffset}
+              pending={pending}
+              viewMode={viewMode}
+              selectedFiles={selectedFiles}
+              onToggleSelectFile={toggleSelectFile}
+              onToggleSelectDir={toggleSelectDir}
+              onToggleSelectGroup={toggleSelectGroup}
+              stage={stage}
+              unstage={unstage}
+              stageOne={stageOne}
+              unstageOne={unstageOne}
+              discardRow={discardRow}
+              setDiscardTarget={setDiscardTarget}
+              openStagedDiff={openStagedDiff}
+              openUnstagedDiff={openUnstagedDiff}
+              onRowContextMenu={fileMenu.openMenu}
+            />
+          </div>
+          {visible && (
+            <CommitFooter
+              workspacePath={gitWorkspacePath}
+              stagedCount={status?.staged.length ?? 0}
+              selectedCount={selectedFiles.size}
+              selectedFiles={selectedFiles}
+              onCommitSelected={handleCommitSelected}
+              busy={pending.commit === true}
+              commitMsg={commitMsg}
+              onCommitMsgChange={setCommitMsg}
+              run={run}
+            />
+          )}
+        </>
       )}
       <ChangesConfirmDialogs
         visible={visible}
@@ -632,6 +669,9 @@ function RepoChangesPanel({
         onConfirmPlan={confirmCommitPlan}
         onCancelPlan={() => setPendingCommitPlan(null)}
       />
+      {visible && fileMenu.menu && (
+        <ChangesFileContextMenu menu={fileMenu.menu} run={run} onClose={fileMenu.closeMenu} />
+      )}
     </aside>
   );
 }
@@ -706,6 +746,7 @@ function ChangesBody({
   setDiscardTarget,
   openStagedDiff,
   openUnstagedDiff,
+  onRowContextMenu,
 }: {
   status: GitStatus | undefined;
   visible: boolean;
@@ -725,6 +766,7 @@ function ChangesBody({
   setDiscardTarget: (target: string[] | null) => void;
   openStagedDiff: (file: string) => void;
   openUnstagedDiff: (file: string) => void;
+  onRowContextMenu: ChangesFileMenuOpener;
 }) {
   const { t } = useTranslation();
   if (!status) return <ChangesPlaceholder text={t("common.loading")} />;
@@ -750,6 +792,7 @@ function ChangesBody({
         rowActionKind="unstage"
         onRowAction={unstageOne}
         onOpen={openStagedDiff}
+        onRowContextMenu={onRowContextMenu}
         actionBusy={pending.unstage === true}
       />
       <GroupSection
@@ -773,6 +816,7 @@ function ChangesBody({
         groupDiscardLabel={t("git.discardAll")}
         onGroupDiscard={setDiscardTarget}
         onOpen={openUnstagedDiff}
+        onRowContextMenu={onRowContextMenu}
         actionBusy={pending.stage === true}
       />
       <GroupSection
@@ -796,6 +840,7 @@ function ChangesBody({
         groupDiscardLabel={t("git.discardAll")}
         onGroupDiscard={setDiscardTarget}
         onOpen={openUnstagedDiff}
+        onRowContextMenu={onRowContextMenu}
         actionBusy={pending.stage === true}
         isNew
       />
@@ -865,6 +910,7 @@ interface GroupSectionProps {
   groupDiscardLabel?: string;
   onGroupDiscard?: (files: string[]) => void;
   onOpen: (file: string) => void;
+  onRowContextMenu: ChangesFileMenuOpener;
   actionBusy: boolean;
   isNew?: boolean;
 }
@@ -890,6 +936,7 @@ const GroupSection = memo(function GroupSection({
   groupDiscardLabel,
   onGroupDiscard,
   onOpen,
+  onRowContextMenu,
   actionBusy,
   isNew = false,
 }: GroupSectionProps) {
@@ -1110,6 +1157,7 @@ const GroupSection = memo(function GroupSection({
                   discardLabel={rowDiscardLabel}
                   onDiscard={onRowDiscard}
                   onOpen={onOpen}
+                  onContextMenu={onRowContextMenu}
                   actionBusy={actionBusy}
                   isNew={isNew}
                 />
@@ -1131,6 +1179,7 @@ const GroupSection = memo(function GroupSection({
                 discardLabel={rowDiscardLabel}
                 onDiscard={onRowDiscard}
                 onOpen={onOpen}
+                onContextMenu={onRowContextMenu}
                 actionBusy={actionBusy}
                 isNew={isNew}
               />
